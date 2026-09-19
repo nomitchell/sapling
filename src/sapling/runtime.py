@@ -1356,6 +1356,22 @@ def terminate_conversation_scope(tx: Any, project_id: str, scope: str) -> None:
         for node in tx.list("research_nodes", project_id=project_id)
         if node.get("work_scope") == scope and node.get("status", "active") == "active"
     }
+    # Older records predate node-level scope tags. Their NODE_CREATED event
+    # still carries the ContextVar scope, which gives us a precise migration
+    # path without guessing from parentage or titles.
+    legacy_scoped_ids = {
+        event.get("payload", {}).get("node_id")
+        for event in tx.history(project_id)
+        if event.get("type") == "NODE_CREATED"
+        and event.get("payload", {}).get("work_scope") == scope
+    }
+    scoped_node_ids.update(
+        node["id"]
+        for node in tx.list("research_nodes", project_id=project_id)
+        if node["id"] in legacy_scoped_ids
+        and not node.get("work_scope")
+        and node.get("status", "active") == "active"
+    )
     evidence_nodes = {
         row.get("producer_node_id")
         for row in tx.list("evidence", project_id=project_id)

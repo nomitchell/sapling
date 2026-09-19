@@ -432,6 +432,14 @@ def test_conversation_limit_cleanup_is_idempotent(workspace):
             "project_id": p["id"], "producer_node_id": evidenced_node["id"],
             "producer_holon_id": root["id"], "summary": "A durable result",
         })
+        legacy_node = tx.create("research_nodes", {
+            "project_id": p["id"], "parent_id": root["assigned_node_id"],
+            "owning_holon_id": root["id"], "status": "active",
+            "title": "Legacy scoped idea",
+        })
+        tx.event(p["id"], "NODE_CREATED", {
+            "node_id": legacy_node["id"], "holon_id": root["id"], "work_scope": scope,
+        })
         before = root["budget_remaining"]
         terminate_conversation_scope(tx, p["id"], scope)
         terminate_conversation_scope(tx, p["id"], scope)
@@ -440,6 +448,7 @@ def test_conversation_limit_cleanup_is_idempotent(workspace):
         assert tx.get("attention_items", alert["id"])["status"] == "resolved"
         assert tx.get("research_nodes", unused_node["id"])["status"] == "abandoned"
         assert tx.get("research_nodes", evidenced_node["id"])["status"] == "completed"
+        assert tx.get("research_nodes", legacy_node["id"])["status"] == "abandoned"
         superseded = [e for e in tx.history(p["id"]) if e["type"] == "ATTENTION_SUPERSEDED"]
         assert len(superseded) == 1
 

@@ -77,6 +77,7 @@ export function Conversation({
   const scroll = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const streamedResponseRef = useRef("");
+  const streamedResponseKey = useRef<string | null>(null);
   const root = data.holarchy.find((item) => item.id === project.root_holon_id);
   const jobs = (
     Array.isArray(data.stats.jobs) ? data.stats.jobs : []
@@ -146,42 +147,32 @@ export function Conversation({
         event.type === "MODEL_STREAM" &&
         !completedStreams.has(String(event.payload.stream_id || "")),
     );
-  const latestStream = [...turnEvents]
-    .reverse()
-    .find((event) => event.type === "MODEL_STREAM");
   const latestAssistantMessage = [...data.messages]
     .reverse()
     .find(message => message.role === "assistant" && message.channel !== "progress");
-  const awaitingAnswer = Boolean(
-    lastInput &&
-    (!latestAssistantMessage ||
-      new Date(latestAssistantMessage.created_at).getTime() < new Date(lastInput.created_at).getTime()),
-  );
-  const displayedStream = liveStream || (awaitingAnswer ? latestStream : undefined);
   const completedTurns = turnEvents.filter(event => event.type === "MODEL_TURN");
   const latestCompletedUsage = (completedTurns.at(-1)?.payload.usage || {}) as Record<string, unknown>;
   const usage = {
     // Input is the current context size, not the sum of context resent across
     // internal calls. Output is the work generated across this response.
-    input: Number(displayedStream?.payload.input_tokens ?? latestCompletedUsage.input_tokens) || 0,
+    input: Number(liveStream?.payload.input_tokens ?? latestCompletedUsage.input_tokens) || 0,
     output: completedTurns.reduce((total, event) => {
       const value = (event.payload.usage || {}) as Record<string, unknown>;
       return total + (Number(value.output_tokens) || 0);
     }, Number(liveStream?.payload.output_tokens) || 0),
-    estimated: Boolean(displayedStream?.payload.estimated),
+    estimated: Boolean(liveStream?.payload.estimated),
   };
-  const responsePreview = String(displayedStream?.payload.response_preview || "");
+  const responsePreview = String(liveStream?.payload.response_preview || "");
   const currentAssistant = Boolean(
     lastInput && latestAssistantMessage &&
     new Date(latestAssistantMessage.created_at).getTime() >= new Date(lastInput.created_at).getTime(),
   );
-  const finalResponse = currentAssistant && latestStream?.payload.response_preview
-    ? latestAssistantMessage?.text || ""
-    : "";
-  const streamTarget = responsePreview || finalResponse;
-  const handingOffResponse = Boolean(
-    finalResponse && streamedResponse !== finalResponse,
-  );
+  const finalResponse = currentAssistant ? latestAssistantMessage?.text || "" : "";
+  const streamTarget = finalResponse || responsePreview;
+  const responseKey = lastInput?.id || latestUserMessage?.id || null;
+  // Once the durable message lands, keep this same rendered element as its
+  // owner. Replacing it with a second timeline element is visually a wipe.
+  const ownsLatestAssistant = currentAssistant && Boolean(streamedResponse);
   const timeline = conversationTimeline(data, project.root_holon_id);
   const started =
     turnEvents.find((event) => event.type === "JOB_STARTED")?.created_at ||
@@ -205,29 +196,21 @@ export function Conversation({
     return () => clearInterval(timer);
   }, [busy, started]);
   useEffect(() => {
-    if (!streamTarget) {
+    if (streamedResponseKey.current !== responseKey) {
+      streamedResponseKey.current = responseKey;
       streamedResponseRef.current = "";
       setStreamedResponse("");
-      return;
     }
-    let frame = 0;
-    const reveal = () => {
-      const current = streamedResponseRef.current;
-      if (current === streamTarget) return;
-      let prefix = current;
-      if (!streamTarget.startsWith(prefix)) {
-        let common = 0;
-        while (common < prefix.length && common < streamTarget.length && prefix[common] === streamTarget[common]) common += 1;
-        prefix = prefix.slice(0, common);
-      }
-      const next = streamTarget.slice(0, prefix.length + Math.min(8, streamTarget.length - prefix.length));
-      streamedResponseRef.current = next;
-      setStreamedResponse(next);
-      frame = requestAnimationFrame(reveal);
-    };
-    frame = requestAnimationFrame(reveal);
-    return () => cancelAnimationFrame(frame);
-  }, [streamTarget]);
+    if (!streamTarget) return;
+    const current = streamedResponseRef.current;
+    // A stream snapshot is a partial JSON field. It can briefly be shorter
+    // while the provider finishes an escape sequence, but the rendered reply
+    // must never rewind. The persisted assistant message is authoritative.
+    if (finalResponse || !current || streamTarget.startsWith(current)) {
+      streamedResponseRef.current = streamTarget;
+      setStreamedResponse(streamTarget);
+    }
+  }, [responseKey, streamTarget, finalResponse]);
   useEffect(() => {
     if (atBottom && scroll.current)
       scroll.current.scrollTo({
@@ -368,7 +351,7 @@ export function Conversation({
           )}
           {timeline.map((entry) =>
             entry.kind === "message" ? (
-              handingOffResponse && entry.message.id === latestAssistantMessage?.id ? null :
+              ownsLatestAssistant && entry.message.id === latestAssistantMessage?.id ? null :
               <article
                 key={entry.id}
                 className={`chat-message ${entry.message.role}`}
@@ -389,8 +372,8 @@ export function Conversation({
               </article>
             ) : null,
           )}
-          {(busy || handingOffResponse || (problem && awaitingAnswer)) && streamedResponse && <article className={`chat-message assistant streaming-response${problem && !busy ? " interrupted" : ""}`} aria-live="polite">
-            <header><Sparkles size={15} /><strong>Sapling</strong><span className="streaming-cursor" aria-hidden="true" /></header>
+          {(ownsLatestAssistant || (!currentAssistant && (busy || streamedResponse || problem))) && streamedResponse && <article className={`chat-message assistant streaming-response${problem && !busy ? " interrupted" : ""}`} aria-live={ownsLatestAssistant ? "off" : "polite"}>
+            <header><Sparkles size={15} /><strong>Sapling</strong>{!ownsLatestAssistant && <span className="streaming-cursor" aria-hidden="true" />}</header>
             <Markdown>{streamedResponse}</Markdown>
             {problem && !busy && <small className="interrupted-note">Interrupted before the proposed actions were applied.</small>}
           </article>}

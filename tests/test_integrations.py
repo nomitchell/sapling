@@ -43,6 +43,33 @@ async def test_tavily_is_preferred_and_credentials_stay_on_provider():
     assert results[0].provider == "tavily" and results[0].summary == "Experiments"
 
 
+@pytest.mark.asyncio
+async def test_search_retries_transient_provider_failures(monkeypatch):
+    attempts, delays = [], []
+
+    async def no_wait(delay):
+        delays.append(delay)
+
+    def handler(request):
+        attempts.append(request)
+        if len(attempts) == 1:
+            return httpx.Response(429, headers={"retry-after": "0.5"})
+        if len(attempts) == 2:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"results": [{
+            "title": "Recovered result", "url": "https://example.org/study", "content": "Evidence",
+        }]})
+
+    monkeypatch.setattr("sapling.integrations.search.asyncio.sleep", no_wait)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with SearchClient(tavily_api_key="test-key", client=client) as search:
+            results = await search.search_web("robustness")
+
+    assert len(attempts) == 3
+    assert delays == [0.5, 2.0]
+    assert results[0].title == "Recovered result"
+
+
 def test_permission_modes_and_scoped_grants():
     assert PermissionPolicy("balanced").evaluate("execute_container").allowed
     assert PermissionPolicy("balanced").evaluate("execute_host").requires_approval

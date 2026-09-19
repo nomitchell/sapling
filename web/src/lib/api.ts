@@ -99,11 +99,23 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
       const data = await response.json();
       message = typeof data.detail === "string" ? data.detail : data.detail ? JSON.stringify(data.detail) : message;
     } catch { /* Preserve HTTP error if proxy response is not JSON. */ }
-    throw new Error(message);
+    throw new ApiError(path, String(options.method || "GET").toUpperCase(), response.status, message);
   }
   if (response.status === 204) return undefined as T;
   const text = await response.text();
   return text ? JSON.parse(text) as T : undefined as T;
+}
+
+export class ApiError extends Error {
+  constructor(
+    public readonly path: string,
+    public readonly method: string,
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
 }
 
 
@@ -134,6 +146,11 @@ export function loadModelCatalog(): Promise<ModelCatalog> {
 }
 
 export function errorText(error: unknown) { return error instanceof Error ? error.message : "Something went wrong. Please try again."; }
+export function errorDiagnostic(error: unknown) {
+  if (error instanceof ApiError)
+    return `${error.method} /api${error.path} · HTTP ${error.status} · ${error.message}`;
+  return errorText(error);
+}
 export function money(value: unknown) { return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Number(value) || 0); }
 export function label(value: unknown) { return String(value ?? "").replaceAll("_", " ").replaceAll("-", " "); }
 export function date(value?: string) { if (!value) return ""; const parsed = new Date(value); return Number.isNaN(parsed.getTime()) ? "" : new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(parsed); }

@@ -4,6 +4,7 @@ import {
   date,
   defaults,
   emptyData,
+  errorDiagnostic,
   errorText,
   loadEvents,
   mergeResearchEvent,
@@ -15,6 +16,7 @@ import {
   ResearchEvent,
 } from "@/lib/api";
 import {
+  AlertCircle,
   ArrowRight,
   CirclePause,
   Folder,
@@ -49,6 +51,7 @@ import { SettingsPanel } from "./settings-panel";
 import { Markdown, Modal } from "./ui";
 
 type Inspection = "direction" | "knowledge" | "researchers" | "experiments" | "activity";
+type WorkspaceError = { title: string; detail: string; source: "refresh" | "action" };
 
 export function Workspace() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -64,7 +67,7 @@ export function Workspace() {
   const [loading, setLoading] = useState(true);
   const [online, setOnline] = useState(false);
   const [connected, setConnected] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState<WorkspaceError | null>(null);
   const [notice, setNotice] = useState("");
   const [create, setCreate] = useState(false);
   const [settings, setSettings] = useState<"global" | "project" | null>(null);
@@ -104,17 +107,25 @@ export function Workspace() {
     );
     if (selectedRef.current !== id) return;
     const update: Partial<ProjectData> = {};
-    let failure = "";
+    const failures: string[] = [];
     results.forEach((result, index) => {
       if (result.status === "fulfilled")
         Object.assign(update, { [paths[index]]: result.value });
-      else failure = errorText(result.reason);
+      else failures.push(`${paths[index]}: ${errorDiagnostic(result.reason)}`);
     });
     setData((current) => ({ ...current, ...update }));
     if (includeEvents && Array.isArray(update.events) && update.events.length) {
       eventCursor.current = update.events.at(-1)?.id || "0";
     }
-    if (failure) setError(failure);
+    if (failures.length) {
+      setError({
+        title: `Couldn’t refresh ${failures.length === 1 ? failures[0].split(":", 1)[0] : `${failures.length} workspace sections`}.`,
+        detail: `Project ${id} · ${failures.join(" · ")}`,
+        source: "refresh",
+      });
+    } else {
+      setError((current) => current?.source === "refresh" ? null : current);
+    }
     return update;
   }, []);
   const refresh = useCallback(() => {
@@ -130,7 +141,11 @@ export function Workspace() {
         const saved = window.localStorage.getItem("sapling-project");
         if (list.some((item) => item.id === saved)) setSelectedId(saved);
       })
-      .catch((err) => setError(errorText(err)))
+      .catch((err) => setError({
+        title: "Couldn’t open the local workspace.",
+        detail: errorDiagnostic(err),
+        source: "action",
+      }))
       .finally(() => setLoading(false));
     return () => {
       active = false;
@@ -138,7 +153,7 @@ export function Workspace() {
   }, [loadProjects]);
   useEffect(() => {
     setData(emptyData);
-    setError("");
+    setError(null);
     if (!selectedId) return;
     window.localStorage.setItem("sapling-project", selectedId);
     let source: EventSource | undefined;
@@ -192,7 +207,11 @@ export function Workspace() {
       eventPoll = setInterval(() => {
         void pollEvents().catch(() => undefined);
       }, 750);
-    }).catch((err) => setError(errorText(err)));
+    }).catch((err) => setError({
+      title: "Couldn’t start live updates.",
+      detail: `Project ${selectedId} · ${errorDiagnostic(err)}`,
+      source: "refresh",
+    }));
     const poll = setInterval(refresh, 5000);
     return () => {
       cancelled = true;
@@ -231,7 +250,20 @@ export function Workspace() {
       );
       refresh();
     } catch (err) {
-      setError(errorText(err));
+      setError({
+        title: `Couldn’t ${selected.research_state === "running" ? "pause" : "resume"} autoresearch.`,
+        detail: `Project ${selected.id} · ${errorDiagnostic(err)}`,
+        source: "action",
+      });
+    }
+  }
+  async function copyErrorDetails() {
+    if (!error) return;
+    try {
+      await navigator.clipboard.writeText(`${error.title}\n${error.detail}`);
+      setNotice("Error details copied");
+    } catch {
+      setNotice("Couldn’t copy error details");
     }
   }
   function discuss(next?: ConversationReference) {
@@ -339,10 +371,18 @@ export function Workspace() {
         </header>
         {error && (
           <div className="error-banner" role="alert">
-            <span>{error}</span>
+            <AlertCircle size={16} />
+            <div className="error-banner-copy">
+              <strong>{error.title}</strong>
+              <small>{error.detail}</small>
+            </div>
+            <button onClick={() => void copyErrorDetails()}>Copy details</button>
+            {selected && error.source === "refresh" && (
+              <button onClick={() => void refreshData(selected.id, true)}>Retry</button>
+            )}
             <button
               className="icon-button"
-              onClick={() => setError("")}
+              onClick={() => setError(null)}
               aria-label="Dismiss error"
             >
               <X size={15} />
@@ -386,10 +426,10 @@ export function Workspace() {
           </section>
         ) : (
           <div className={`canopy-workspace ${converseOpen ? "converse-open" : ""}`}>
-            <ResearchCanvas key={selected.id} project={selected} data={data} onDiscuss={discuss} onRefresh={refresh} onError={setError} onKnowledge={() => setInspection("knowledge")} />
+            <ResearchCanvas key={selected.id} project={selected} data={data} onDiscuss={discuss} onRefresh={refresh} onError={(message) => setError({ title: "Research canvas action failed.", detail: message, source: "action" })} onKnowledge={() => setInspection("knowledge")} />
             <aside id="converse-drawer" className="converse-drawer" aria-label="Converse" inert={!converseOpen} aria-hidden={!converseOpen}>
               <header className="converse-heading"><div><MessageSquare size={15} /><strong>Converse</strong><span>Your research partner</span></div><button className="icon-button" aria-label="Close Converse" onClick={() => { setConverseOpen(false); converseToggle.current?.focus(); }}><X size={16} /></button></header>
-              <Conversation key={selected.id} project={selected} data={data} connected={connected} onRefresh={refresh} onSettings={() => openSettings("project", "models")} onError={setError} reference={reference} onClearReference={() => setReference(null)} visible={converseOpen} />
+              <Conversation key={selected.id} project={selected} data={data} connected={connected} onRefresh={refresh} onSettings={() => openSettings("project", "models")} onError={(message) => setError({ title: "Conversation action failed.", detail: message, source: "action" })} reference={reference} onClearReference={() => setReference(null)} visible={converseOpen} />
             </aside>
           </div>
         )}
@@ -397,7 +437,7 @@ export function Workspace() {
       {inspection && selected && <Modal title={inspection === "direction" ? "Research direction" : inspection === "knowledge" ? "Shared knowledge" : inspection[0].toUpperCase() + inspection.slice(1)} onClose={() => setInspection(null)} wide><div className="resource-inspection">
         {inspection === "direction" && <ResearchBrief project={selected} data={data} />}
         {inspection === "knowledge" && <Commons claims={data.claims} evidence={data.evidence} artifacts={data.artifacts} />}
-        {inspection === "researchers" && <Holarchy records={data.holarchy} onChange={refresh} onError={setError} />}
+        {inspection === "researchers" && <Holarchy records={data.holarchy} onChange={refresh} onError={(message) => setError({ title: "Researcher control failed.", detail: message, source: "action" })} />}
         {inspection === "experiments" && <Experiments records={data.experiments} />}
         {inspection === "activity" && <Operations project={selected} data={data} onDelete={() => { setInspection(null); setArchive(true); }} />}
       </div></Modal>}
@@ -463,7 +503,11 @@ export function Workspace() {
                       setSelectedId(null);
                       refresh();
                     })
-                    .catch((err) => setError(errorText(err)))
+                    .catch((err) => setError({
+                      title: "Couldn’t delete the project.",
+                      detail: `Project ${selected.id} · ${errorDiagnostic(err)}`,
+                      source: "action",
+                    }))
                 }
               >
                 Delete project

@@ -211,6 +211,23 @@ def work(nid="n", kind="search_literature", **kwargs):
     }
 
 
+@pytest.mark.parametrize(
+    ("kind", "arguments", "field"),
+    [
+        ("search_web", {"search_queries": "optimization"}, "query"),
+        ("search_literature", {}, "query"),
+        ("read_paper", {}, "query"),
+        ("open_source", {}, "url"),
+        ("read_artifact", {}, "artifact_id"),
+        ("retrieve_evidence", {}, "evidence_id"),
+    ],
+)
+def test_work_orders_require_their_dispatch_arguments(store, kind, arguments, field):
+    order = work(kind=kind, arguments=arguments)
+    with pytest.raises(RuntimeRejected, match=field):
+        apply(store, decision(work_orders=[order]))
+
+
 def test_priority_formula_exploration_cost_and_widening():
     expected = (0.7 + 0.5 * math.sqrt(math.log(11) / 3)) / 2
     assert branch_priority(0.7, 10, 2, 4) == pytest.approx(expected)

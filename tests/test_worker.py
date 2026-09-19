@@ -206,6 +206,34 @@ async def test_baseten_rate_limit_retries_before_the_turn_fails(worker_app, monk
 
 
 @pytest.mark.asyncio
+async def test_unexpected_job_failure_records_context_and_redacts_credentials(worker_app, monkeypatch):
+    _, store, worker, _ = worker_app
+    project, holon = create_project(worker_app)
+    with store.transaction() as tx:
+        tx.cancel_queued(holon["id"])
+        tx.enqueue(project["id"], holon["id"], "turn", {"reason": "diagnostic_test"})
+    leased = store.claim("diagnostic-worker")
+    assert leased is not None
+
+    async def fail(_job):
+        raise RuntimeError("provider rejected api_key=tvly-secret-example on request 17")
+
+    monkeypatch.setattr(worker, "perform", fail)
+    await worker._perform_leased(leased, "diagnostic-worker")
+
+    with store.transaction() as tx:
+        event = [row for row in tx.history(project["id"]) if row["type"] == "JOB_ERROR"][-1]
+        attention = tx.list("attention_items", project["id"], type="error")[-1]
+    assert event["payload"]["holon_id"] == holon["id"]
+    assert event["payload"]["node_id"] == holon["assigned_node_id"]
+    assert event["payload"]["job_kind"] == "turn"
+    assert event["payload"]["error_type"] == "RuntimeError"
+    assert "request 17" in attention["summary"]
+    assert "tvly-secret-example" not in str(event)
+    assert "tvly-secret-example" not in attention["summary"]
+
+
+@pytest.mark.asyncio
 async def test_ask_mode_records_exact_action_without_running_it(worker_app):
     _, store, worker, directory = worker_app
     project, holon = create_project(worker_app)

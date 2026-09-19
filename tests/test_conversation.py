@@ -418,12 +418,28 @@ def test_conversation_limit_cleanup_is_idempotent(workspace):
             "type": "tool_error", "pauses_subtree": True,
             "summary": "A scoped tool failed", "work_scope": scope,
         })
+        unused_node = tx.create("research_nodes", {
+            "project_id": p["id"], "parent_id": root["assigned_node_id"],
+            "owning_holon_id": root["id"], "status": "active",
+            "title": "Unused bounded idea", "work_scope": scope,
+        })
+        evidenced_node = tx.create("research_nodes", {
+            "project_id": p["id"], "parent_id": root["assigned_node_id"],
+            "owning_holon_id": root["id"], "status": "active",
+            "title": "Finished bounded check", "work_scope": scope,
+        })
+        tx.create("evidence", {
+            "project_id": p["id"], "producer_node_id": evidenced_node["id"],
+            "producer_holon_id": root["id"], "summary": "A durable result",
+        })
         before = root["budget_remaining"]
         terminate_conversation_scope(tx, p["id"], scope)
         terminate_conversation_scope(tx, p["id"], scope)
         assert tx.get("holons", child["id"])["budget_remaining"] == 0
         assert tx.get("holons", root["id"])["budget_remaining"] == pytest.approx(before + 0.03)
         assert tx.get("attention_items", alert["id"])["status"] == "resolved"
+        assert tx.get("research_nodes", unused_node["id"])["status"] == "abandoned"
+        assert tx.get("research_nodes", evidenced_node["id"])["status"] == "completed"
         superseded = [e for e in tx.history(p["id"]) if e["type"] == "ATTENTION_SUPERSEDED"]
         assert len(superseded) == 1
 
@@ -750,6 +766,70 @@ async def test_bounded_conversation_reserves_its_last_model_call_for_an_answer(w
         request = current["conversation_requests"][current["active_conversation_id"]]
         assert request["state"] == "completed"
         assert tx.list("messages", project_id=p["id"])[-1]["text"].startswith("Here is the answer")
+
+
+@pytest.mark.asyncio
+async def test_root_blocked_completion_without_attention_recovers_instead_of_false_completion(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Search first, then report back"})
+    with store.transaction() as tx:
+        current = tx.get("projects", p["id"])
+        scope = "conversation:" + current["active_conversation_id"]
+
+    async def model(context, schema, settings):
+        return {
+            "decision": HolonDecision(
+                response="I found one lead and will now search for the remaining sources.",
+                updated_summary="One lead found; the requested synthesis is incomplete.",
+                completion={"summary": "Not complete; more sources are needed.", "outcome": "blocked"},
+            ),
+            "usage": {},
+            "cost_usd": 0,
+        }
+
+    await run_turn(store, p["root_holon_id"], model, None, scope=scope)
+    with store.transaction() as tx:
+        current = tx.get("projects", p["id"])
+        request = current["conversation_requests"][current["active_conversation_id"]]
+        root = tx.get("holons", p["root_holon_id"])
+        messages = tx.list("messages", project_id=p["id"])
+        jobs = tx.jobs(p["id"])
+        assert request["state"] == "active"
+        assert root["empty_turn_count"] == 1
+        assert "Do not promise future work" in root["runtime_feedback"]
+        assert messages[-1]["channel"] == "progress"
+        assert any(job["state"] == "queued" and job["holon_id"] == p["root_holon_id"] for job in jobs)
+        assert any(event["type"] == "CONVERSATION_STALL_RECOVERING" for event in tx.history(p["id"]))
+
+
+@pytest.mark.asyncio
+async def test_repeated_root_stall_forces_a_final_synthesis(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Search first, then report back"})
+    with store.transaction() as tx:
+        current = tx.get("projects", p["id"])
+        scope = "conversation:" + current["active_conversation_id"]
+        tx.update("holons", p["root_holon_id"], {"empty_turn_count": 2})
+    observed = {}
+
+    async def model(context, schema, settings):
+        observed["schema"] = schema
+        return {
+            "decision": schema(
+                response="Here is the best synthesis from the sources available so far.",
+                updated_summary="Returned a bounded synthesis after stalled actions.",
+            ),
+            "usage": {},
+            "cost_usd": 0,
+        }
+
+    await run_turn(store, p["root_holon_id"], model, None, scope=scope)
+    assert observed["schema"] is ConversationSynthesis
+    with store.transaction() as tx:
+        current = tx.get("projects", p["id"])
+        request = current["conversation_requests"][current["active_conversation_id"]]
+        assert request["state"] == "completed"
+        assert tx.list("messages", project_id=p["id"])[-1]["channel"] == "answer"
 
 
 @pytest.mark.asyncio

@@ -226,6 +226,34 @@ a {
   background: var(--panel);
   border-color: var(--border);
 }
+.error-banner-copy {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 2px;
+}
+.error-banner-copy strong {
+  font-size: 11px;
+  font-weight: 600;
+}
+.error-banner-copy small {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.error-banner > button:not(.icon-button) {
+  flex: 0 0 auto;
+  color: var(--ink-soft);
+  font-size: 10px;
+  text-decoration: none;
+}
+.error-banner > button:not(.icon-button):hover {
+  color: var(--ink);
+}
 .notice {
   background: var(--panel);
   color: var(--ink);

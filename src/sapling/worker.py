@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -13,6 +14,22 @@ from .credentials import is_placeholder
 from .store import now
 
 log = logging.getLogger(__name__)
+
+
+def safe_error_detail(exc: Exception) -> str:
+    """Keep actionable provider/tool context without persisting credentials."""
+    detail = re.sub(r"\s+", " ", str(exc)).strip()
+    if not detail:
+        return "No additional error detail was provided."
+    patterns = (
+        (r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+", r"\1[redacted]"),
+        (r"\bsk-[A-Za-z0-9_-]{8,}\b", "[redacted OpenAI key]"),
+        (r"\btvly-[A-Za-z0-9_-]{8,}\b", "[redacted Tavily key]"),
+        (r"\b(?:api[_ -]?key|token|secret)\s*[=:]\s*[^\s,;]+", "credential=[redacted]"),
+    )
+    for pattern, replacement in patterns:
+        detail = re.sub(pattern, replacement, detail)
+    return detail[:800]
 
 
 def serialize(value):
@@ -213,8 +230,13 @@ class Worker:
                 )
             raise
         except Exception as exc:
-            message = f"{type(exc).__name__}: research job failed; inspect its action and retry after correcting configuration."
-            log.warning("Job %s failed (%s)", job["id"], type(exc).__name__)
+            error_type = type(exc).__name__
+            detail = safe_error_detail(exc)
+            with self.store.transaction() as tx:
+                failed_holon = tx.get("holons", job["holon_id"]) or {}
+                node_id = failed_holon.get("assigned_node_id")
+            message = f"{job['kind']} failed on node {node_id or 'unknown'} ({error_type}): {detail}"
+            log.exception("Job %s failed (%s)", job["id"], error_type)
             self.store.finish(job["id"], owner, message)
             with self.store.transaction() as tx:
                 tx.update("holons", job["holon_id"], {"status": "error"})
@@ -233,7 +255,18 @@ class Worker:
                         "job_id": job["id"],
                     },
                 )
-                tx.event(job["project_id"], "JOB_ERROR", {"job_id": job["id"], "error": message})
+                tx.event(
+                    job["project_id"],
+                    "JOB_ERROR",
+                    {
+                        "job_id": job["id"],
+                        "holon_id": job["holon_id"],
+                        "node_id": node_id,
+                        "job_kind": job["kind"],
+                        "error_type": error_type,
+                        "error": message,
+                    },
+                )
         else:
             self.store.finish(job["id"], owner)
         finally:
@@ -346,7 +379,12 @@ class Worker:
             input_bound = input_token_bound(context, schema, instructions)
             input_cost = input_bound * settings["input_cost_per_million"] / 1_000_000
             cap = config.get("max_cost_usd", settings["max_turn_cost_usd"])
-            affordable = int(max(0, cap - input_cost) * 1_000_000 / settings["output_cost_per_million"])
+            output_price = settings["output_cost_per_million"]
+            affordable = (
+                output_limit
+                if output_price <= 0
+                else int(max(0, cap - input_cost) * 1_000_000 / output_price)
+            )
             minimum_tokens = config.get("_minimum_output_tokens", 256)
             if affordable < minimum_tokens:
                 error = ValueError(
@@ -402,9 +440,11 @@ class Worker:
     async def dispatch(self, order, holon, project, *, approval_id=None):
         from .integrations.permissions import PermissionPolicy
         from .integrations.search import SearchClient, extract_text
+        from .runtime import validate_work_order_arguments
 
         order = serialize(order)
         kind, args = order["kind"], order.get("arguments", {})
+        validate_work_order_arguments(kind, args)
         pid = project["id"]
         with self.store.transaction() as tx:
             from .runtime import _runnable, work_scope

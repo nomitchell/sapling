@@ -174,26 +174,41 @@ class SearchClient:
 
     async def _json(self, url: str, **kwargs: object) -> dict:
         method = kwargs.pop("method", "GET")
-        try:
-            async with asyncio.timeout(self.timeout_seconds):
-                async with self.client.stream(method, url, follow_redirects=False, **kwargs) as response:
-                    if response.status_code in {401, 403}:
-                        raise SearchUnavailable("Search authorization failed. Check the provider key in Connections; for SearXNG, enable JSON in search.formats.")
-                    if response.status_code == 429:
-                        raise SearchUnavailable("The search provider rate limit was reached. Retry later or configure an API key.")
-                    response.raise_for_status()
-                    chunks, size = [], 0
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > 5_000_000:
-                            raise SearchUnavailable("The search response exceeded the 5 MB limit.")
-                        chunks.append(chunk)
-                    result = json.loads(b"".join(chunks))
-                    if not isinstance(result, dict):
-                        raise SearchUnavailable("The search provider returned an unexpected response.")
-                    return result
-        except (httpx.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
-            raise SearchUnavailable("Search could not complete. Check connectivity and the configured search service.") from exc
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                async with asyncio.timeout(self.timeout_seconds):
+                    async with self.client.stream(method, url, follow_redirects=False, **kwargs) as response:
+                        if response.status_code in {401, 403}:
+                            raise SearchUnavailable("Search authorization failed. Check the provider key in Connections; for SearXNG, enable JSON in search.formats.")
+                        if response.status_code == 429 or response.status_code in {502, 503, 504}:
+                            if attempt < 2:
+                                retry_after = response.headers.get("retry-after", "")
+                                delay = min(8.0, max(0.25, float(retry_after))) if retry_after.replace(".", "", 1).isdigit() else float(2**attempt)
+                                await asyncio.sleep(delay)
+                                continue
+                            if response.status_code == 429:
+                                raise SearchUnavailable("The search provider rate limit persisted after three attempts. Retry later or use another discovery route.")
+                            raise SearchUnavailable(f"The search provider remained unavailable after three attempts (HTTP {response.status_code}).")
+                        response.raise_for_status()
+                        chunks, size = [], 0
+                        async for chunk in response.aiter_bytes():
+                            size += len(chunk)
+                            if size > 5_000_000:
+                                raise SearchUnavailable("The search response exceeded the 5 MB limit.")
+                            chunks.append(chunk)
+                        result = json.loads(b"".join(chunks))
+                        if not isinstance(result, dict):
+                            raise SearchUnavailable("The search provider returned an unexpected response.")
+                        return result
+            except SearchUnavailable:
+                raise
+            except (httpx.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(float(2**attempt))
+                    continue
+        raise SearchUnavailable("Search could not complete after three attempts. Check connectivity and the configured search service.") from last_error
 
     async def search_literature(self, query: str, limit: int = 8) -> list[SearchResult]:
         query, limit = self._query(query, limit)

@@ -1347,6 +1347,32 @@ def terminate_conversation_scope(tx: Any, project_id: str, scope: str) -> None:
                 "CONVERSATION_NODE_RELEASED",
                 {"node_id": node["id"], "holon_id": holon["id"], "scope": scope},
             )
+    # Branches proposed by a bounded conversation are useful while that turn
+    # is running, but they must not look like live autoresearch after the turn
+    # has ended. A branch with durable evidence is done; an unused proposal is
+    # queued work that was intentionally abandoned with the conversation.
+    scoped_node_ids = {
+        node["id"]
+        for node in tx.list("research_nodes", project_id=project_id)
+        if node.get("work_scope") == scope and node.get("status", "active") == "active"
+    }
+    evidence_nodes = {
+        row.get("producer_node_id")
+        for row in tx.list("evidence", project_id=project_id)
+        if row.get("producer_node_id") in scoped_node_ids
+    }
+    for node_id in scoped_node_ids:
+        status = "completed" if node_id in evidence_nodes else "abandoned"
+        tx.update("research_nodes", node_id, {"status": status})
+        tx.event(
+            project_id,
+            "NODE_UPDATED",
+            {
+                "node_id": node_id,
+                "status": status,
+                "reason": "bounded_conversation_finished",
+            },
+        )
 
 
 def _frontier(tx: Any, holon: dict) -> list[dict]:
@@ -1468,6 +1494,28 @@ def _valid_experiment_command(arguments: dict[str, Any]) -> bool:
         and command
         and all(isinstance(part, str) and part for part in command)
     )
+
+
+def validate_work_order_arguments(kind: str, arguments: Any) -> None:
+    """Reject incomplete tool calls before they become opaque worker errors."""
+    if not isinstance(arguments, dict):
+        raise RuntimeRejected(f"{kind} arguments must be an object")
+    required = {
+        "search_literature": "query",
+        "search_web": "query",
+        "read_paper": "query",
+        "open_source": "url",
+        "read_artifact": "artifact_id",
+        "retrieve_evidence": "evidence_id",
+    }
+    field = required.get(kind)
+    if field and (
+        not isinstance(arguments.get(field), str)
+        or not arguments[field].strip()
+    ):
+        raise RuntimeRejected(f"{kind} requires a nonempty string {field}")
+    if kind == "run_experiment" and not _valid_experiment_command(arguments):
+        raise RuntimeRejected("run_experiment requires a nonempty command argument list")
 
 
 def _send(tx: Any, project: dict, sender: dict, message: HolonMessage) -> None:
@@ -1769,12 +1817,18 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 "evidence_epoch": project.get("evidence_epoch", 0),
                 "search_operator": operator,
                 "generation": int(parent.get("generation", 0)) + 1,
+                "work_scope": allocation_scope,
             },
         )
         tx.event(
             pid,
             "NODE_CREATED",
-            {"node_id": node["id"], "holon_id": hid, "automatic": automatic},
+            {
+                "node_id": node["id"],
+                "holon_id": hid,
+                "automatic": automatic,
+                "work_scope": allocation_scope,
+            },
         )
         return node
 
@@ -1804,6 +1858,8 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
             # visible branch so provider repetition cannot consume widening
             # capacity or strand the coordinator before delegation begins.
             node = existing
+            if allocation_scope != "research" and not node.get("work_scope"):
+                node = tx.update("research_nodes", node["id"], {"work_scope": allocation_scope})
             tx.event(
                 pid,
                 "NODE_REUSED",
@@ -2193,7 +2249,10 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 # short progress notes and tool actions.
                 "channel": (
                     "progress"
-                    if work_scope(holon) == "research" and project.get("research_state") == "running"
+                    if (
+                        (work_scope(holon) == "research" and project.get("research_state") == "running")
+                        or (decision.completion is not None and decision.completion.outcome == "blocked")
+                    )
                     else "answer"
                 ),
                 "content": decision.response,
@@ -2329,8 +2388,7 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
             node = _local_node(tx, resolve(order.node_id), holon)
             if node["id"] not in priorities:
                 raise RuntimeRejected("Cannot execute work on an inactive research node")
-            if order.kind == "run_experiment" and not _valid_experiment_command(order.arguments):
-                raise RuntimeRejected("run_experiment requires a nonempty command argument list")
+            validate_work_order_arguments(order.kind, order.arguments)
             _validate_arguments(tx, order.arguments, holon)
         if work:
             order = work[0]
@@ -2790,6 +2848,7 @@ async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *
         and (
             request.get("tool_calls", 0) >= request.get("max_tool_calls", 32)
             or request.get("model_calls", 0) >= request.get("max_model_calls", 48) - 1
+            or int(holon.get("empty_turn_count", 0)) >= 2
         )
     )
     schema = ConversationSynthesis if synthesis_only else HolonDecision
@@ -2884,7 +2943,40 @@ async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *
                 for h in tx.list("holons", project_id=pid)
                 if h.get("work_scope") == work_scope(holon) and h.get("status") != "completed"
             ]
-            if (decision.response or decision.completion) and not children:
+            reported_block = bool(decision.completion and decision.completion.outcome == "blocked")
+            pending_attention = any(
+                item.get("work_scope") == work_scope(holon) and item.get("status") == "pending"
+                for item in tx.list("attention_items", project_id=pid)
+            )
+            if reported_block and not children and not pending_attention:
+                count = int(holon.get("empty_turn_count", 0)) + 1
+                tx.update(
+                    "holons",
+                    holon_id,
+                    {
+                        "empty_turn_count": count,
+                        "runtime_feedback": (
+                            "You marked this conversation blocked or incomplete, but created no attention item "
+                            "and queued no executable work. Do not promise future work without scheduling it. "
+                            "Run a valid work_order now, delegate concrete independent work, or return a final "
+                            "synthesis from the evidence already available."
+                        ),
+                    },
+                )
+                tx.event(
+                    pid,
+                    "CONVERSATION_STALL_RECOVERING",
+                    {
+                        "holon_id": holon_id,
+                        "reason": "blocked_without_attention_or_work",
+                        "attempt": count,
+                        "next_mode": "synthesis" if count >= 2 else "decision",
+                    },
+                )
+                tx.enqueue(pid, holon_id, "turn", {"reason": "blocked_completion_recovery"})
+            elif reported_block:
+                tx.update("holons", holon_id, {"empty_turn_count": 0})
+            elif (decision.response or decision.completion) and not children:
                 tx.update("holons", holon_id, {"empty_turn_count": 0, "runtime_feedback": None})
                 update_request(tx, pid, work_scope(holon), {"state": "completed"})
                 terminate_conversation_scope(tx, pid, work_scope(holon))
@@ -3024,8 +3116,10 @@ async def execute_work_order(store: Any, holon_id: str, work_order: dict, tool_d
                 "WORK_ERROR",
                 {
                     "holon_id": holon_id,
+                    "node_id": work_order["node_id"],
                     "kind": work_order["kind"],
                     "error_type": type(exc).__name__,
+                    "message": str(exc).strip()[:600] or type(exc).__name__,
                     "recoverable": recoverable,
                 },
             )

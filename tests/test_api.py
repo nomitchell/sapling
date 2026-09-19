@@ -46,7 +46,8 @@ def test_project_bootstrap_chat_and_isolation(app_client):
     assert r.status_code == 201, r.text
     assert client.get(f"/projects/{other['id']}/messages").json() == []
     with store.transaction() as tx:
-        assert tx.get("projects", p["id"])["control_epoch"] == 1
+        assert tx.get("holons", p["root_holon_id"])["context_epoch"] == 1
+        assert tx.get("projects", p["id"])["control_epoch"] == 0
         assert len(tx.list("human_inputs", p["id"])) == 1
         assert len(tx.jobs(p["id"])) == 1
 

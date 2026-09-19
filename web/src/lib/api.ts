@@ -20,7 +20,7 @@ export const defaults: ResearchSettings = {
   provider: "openai", model: "gpt-5.4-nano", reasoning_effort: "low", cadence: 0.5,
   budget_total: 10, permission_mode: "balanced", execution_backend: "docker",
   max_concurrent_holons: 4, max_depth: 5, experiment_timeout: 300,
-  max_output_tokens: 4096, max_turn_cost_usd: 1,
+  max_output_tokens: 8192, max_turn_cost_usd: 1,
   input_cost_per_million: 0.2, output_cost_per_million: 1.25, cached_input_cost_per_million: 0.02,
 };
 
@@ -30,6 +30,8 @@ export type Project = {
   root_holon_id?: string; created_at: string;
 };
 export type Message = { id: string; role: string; text: string; created_at: string };
+export type ProjectData = { messages: Message[]; tree: RecordItem[]; holarchy: RecordItem[]; claims: RecordItem[]; evidence: RecordItem[]; experiments: RecordItem[]; attention: RecordItem[]; events: ResearchEvent[]; stats: Stats; artifacts: RecordItem[] };
+export const emptyData: ProjectData = { messages: [], tree: [], holarchy: [], claims: [], evidence: [], experiments: [], attention: [], events: [], stats: {}, artifacts: [] };
 export type RecordItem = Record<string, unknown> & { id: string; title?: string; status?: string; created_at?: string };
 export type ResearchEvent = { id: string; type: string; payload: Record<string, unknown>; created_at: string };
 export type Stats = Record<string, unknown>;
@@ -64,6 +66,10 @@ export type ModelCatalog = { models: ModelOption[]; default_model: string };
 export const fallbackModelCatalog: ModelCatalog = {
   default_model: "gpt-5.4-nano",
   models: [
+    { id: "gpt-6-astra", label: "GPT-6 Astra", reasoning_efforts: ["low", "medium", "high", "xhigh", "max"], input_cost_per_million: 10, cached_input_cost_per_million: 1, output_cost_per_million: 50 },
+    { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"], input_cost_per_million: 4, cached_input_cost_per_million: 0.4, output_cost_per_million: 20 },
+    { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"], input_cost_per_million: 2, cached_input_cost_per_million: 0.2, output_cost_per_million: 12 },
+    { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"], input_cost_per_million: 0.2, cached_input_cost_per_million: 0.02, output_cost_per_million: 1.2 },
     { id: "gpt-5.4-nano", label: "GPT-5.4 nano", reasoning_efforts: ["none", "low", "medium", "high", "xhigh"], input_cost_per_million: 0.2, output_cost_per_million: 1.25, cached_input_cost_per_million: 0.02 },
     { id: "gpt-5.4-mini", label: "GPT-5.4 mini", reasoning_efforts: ["none", "low", "medium", "high", "xhigh"], input_cost_per_million: 0.75, output_cost_per_million: 4.5 },
     { id: "gpt-5-mini", label: "GPT-5 mini", reasoning_efforts: ["minimal", "low", "medium", "high"], input_cost_per_million: 0.25, output_cost_per_million: 2 },

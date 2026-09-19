@@ -15,7 +15,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import DATA_DIR, DATABASE_URL, ProjectSettings
 from .credentials import CredentialVault
-from .model_catalog import MODELS, DEFAULT_MODEL, merge_settings
+from .model_catalog import DEFAULT_MODEL, MODELS, merge_settings
 from .store import Store
 
 
@@ -25,7 +25,6 @@ class Input(BaseModel):
 
 class CreateProject(Input):
     title: str = Field(min_length=1, max_length=200)
-    goal: str = Field(default="", max_length=20000)
     settings: dict | None = None
 
 
@@ -147,6 +146,7 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
     @app.get("/models")
     async def model_catalog():
         import time
+
         cached = getattr(app.state, "model_catalog", None)
         if cached and time.monotonic() - cached[0] < 300:
             return cached[1]
@@ -154,13 +154,20 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
         error = None
         if vault.get("openai"):
             from openai import AsyncOpenAI
+
             try:
                 async with AsyncOpenAI(api_key=vault.get("openai"), timeout=15, max_retries=0) as provider:
                     result = await provider.models.list()
                     available = {m.id for m in result.data}
             except Exception:
                 error = "Could not refresh account model availability. Presets remain available."
-        result = {"models": [m | {"available": m["id"] in available if available is not None else None} for m in MODELS], "default_model": DEFAULT_MODEL, "error": error}
+        result = {
+            "models": [
+                m | {"available": m["id"] in available if available is not None else None} for m in MODELS
+            ],
+            "default_model": DEFAULT_MODEL,
+            "error": error,
+        }
         app.state.model_catalog = (time.monotonic(), result)
         return result
 
@@ -200,7 +207,7 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                 merge_settings(global_settings(tx), body.settings or {})
             ).model_dump()
             pid, hid, nid = (str(uuid4()) for _ in range(3))
-            goal = body.goal.strip() or body.title.strip()
+            goal = ""
             project = tx.create(
                 "projects",
                 {
@@ -242,9 +249,9 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                     "project_id": pid,
                     "parent_id": None,
                     "owning_holon_id": hid,
-                    "title": body.title.strip(),
+                    "title": "Research direction",
                     "direction": goal,
-                    "rationale": "Human research objective",
+                    "rationale": "Direction develops through conversation",
                     "interpretation": "",
                     "status": "active",
                     "visits": 0,
@@ -353,17 +360,86 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
             message = tx.create(
                 "messages", {"project_id": pid, "role": "user", "text": value, "human_input_id": human["id"]}
             )
+            # A reply in chat resolves scientific questions in the same channel.
+            # Permission approvals are explicit and never inferred from prose.
+            root = require(tx, "holons", p["root_holon_id"])
+            for item in tx.list("attention_items", pid, status="pending"):
+                if item.get("holon_id") != root["id"] or item.get("type") == "permission":
+                    continue
+                tx.update(
+                    "attention_items",
+                    item["id"],
+                    {"status": "resolved", "response": value, "human_input_id": human["id"]},
+                )
+                if item.get("decision_snapshot_id"):
+                    tx.update(
+                        "decision_snapshots",
+                        item["decision_snapshot_id"],
+                        {"human_override": {"human_input_id": human["id"], "text": value}},
+                    )
+                tx.event(pid, "ATTENTION_RESOLVED", {"attention_id": item["id"], "via": "conversation"})
             tx.update(
-                "projects",
-                pid,
+                "holons",
+                root["id"],
                 {
-                    "control_epoch": p.get("control_epoch", 0) + 1,
-                    "evidence_epoch": p.get("evidence_epoch", 0) + 1,
+                    "status": "active",
+                    "chat_stopped": False,
+                    "model_retry_count": 0,
+                    "blocked_reason": None,
+                    "context_epoch": root.get("context_epoch", 0) + 1,
                 },
             )
+            node = require(tx, "research_nodes", root["assigned_node_id"])
+            if node["status"] != "active":
+                tx.update("research_nodes", node["id"], {"status": "active"})
             tx.event(pid, "HUMAN_INPUT", {"message_id": message["id"], "human_input_id": human["id"]})
             wake(tx, p)
             return message
+
+    @app.post("/projects/{pid}/conversation/stop")
+    async def stop_conversation(pid: str):
+        with store.transaction() as tx:
+            p = require(tx, "projects", pid)
+            h = require(tx, "holons", p["root_holon_id"])
+            tx.update(
+                "holons", h["id"], {"chat_stopped": True, "control_epoch": h.get("control_epoch", 0) + 1}
+            )
+            tx.cancel_queued(h["id"])
+            tx.event(pid, "CONVERSATION_STOPPED", {"holon_id": h["id"]})
+        worker = getattr(app.state, "worker", None)
+        if worker:
+            await worker.stop_holon(h["id"])
+        return {"status": "stopped", "background_research": p["status"]}
+
+    @app.post("/projects/{pid}/conversation/retry")
+    def retry_conversation(pid: str):
+        with store.transaction() as tx:
+            p = require(tx, "projects", pid)
+            if not tx.list("messages", pid):
+                raise HTTPException(409, "Start with a message")
+            h = require(tx, "holons", p["root_holon_id"])
+            tx.update(
+                "holons",
+                h["id"],
+                {
+                    "status": "active",
+                    "chat_stopped": False,
+                    "model_retry_count": 0,
+                    "blocked_reason": None,
+                    "context_epoch": h.get("context_epoch", 0) + 1,
+                },
+            )
+            tx.update("research_nodes", h["assigned_node_id"], {"status": "active"})
+            for item in tx.list("attention_items", pid, status="pending"):
+                if item.get("holon_id") == h["id"] and item.get("type") != "permission":
+                    tx.update(
+                        "attention_items",
+                        item["id"],
+                        {"status": "resolved", "resolution": "Retried from conversation"},
+                    )
+            wake(tx, p)
+            tx.event(pid, "CONVERSATION_RETRIED", {"holon_id": h["id"]})
+        return {"status": "queued"}
 
     def listing(kind):
         def read(pid: str):

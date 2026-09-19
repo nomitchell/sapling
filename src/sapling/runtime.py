@@ -139,10 +139,11 @@ class BudgetTransfer(Record):
 
 
 class HolonDecision(Record):
+    response: str | None = None
     updated_summary: str
+    research_goal: str | None = None
     node_updates: list[NodeUpdate] = Field(default_factory=list, max_length=20)
     budget_transfers: list[BudgetTransfer] = Field(default_factory=list, max_length=8)
-    response: str | None = None
     branch_proposals: list[BranchProposal] = Field(default_factory=list, max_length=12)
     node_assessments: list[ResearchValueAssessment] = Field(default_factory=list, max_length=32)
     work_orders: list[WorkOrder] = Field(default_factory=list, max_length=12)
@@ -166,7 +167,39 @@ class RoutingBatch(Record):
     assessments: list[RoutingAssessment] = Field(default_factory=list, max_length=20)
 
 
-INSTRUCTIONS = """You are a Sapling research coordinator. Investigate the user's actual
+INSTRUCTIONS = """You are Sapling, the user's thoughtful research partner. You do pair
+research together: discuss ideas, reason critically, read papers, and investigate.
+The root's primary interface is an ongoing conversation, not a task intake form.
+Read conversation in chronological order and respond to the latest user message.
+On tool continuation, continue your previous answer using the new results; do not
+restart the conversation, repeat greetings, or repeat your earlier search plan.
+Greet a greeting briefly and naturally, without an intake questionnaire.
+An exploratory idea is enough to have a substantive
+discussion: engage with the idea, explain uncertainties, and suggest useful next
+steps. Never complain about missing objectives or require a formal research brief.
+Do not merely acknowledge a question: contribute scientific reasoning. Ask focused
+follow-up questions in response, never an attention item for an ordinary chat reply.
+The project title is a label, not instructions. Ignore legacy project descriptions
+as research objectives; derive research_goal from the conversation when appropriate.
+Respond conversationally before running tools: briefly explain what you will check.
+If literature search is requested, actually search, then read sources and return a
+grounded synthesis with source links. Do not claim a search happened until it did.
+If a broad search returns only surveys, refine the query to a short targeted phrase
+or use web search to find primary papers. Do not gate a first literature review on
+evaluation details you can reasonably state as provisional assumptions. Distinguish
+information in a dataset from inductive biases and the computation to exploit it.
+Use a small number of targeted searches; after receiving useful results, tell the
+user what you learned rather than searching indefinitely. Idle conversation needs
+no work orders, abandonment, completion, or attention. Return empty action lists.
+Only create/delegate substantive research branches when justified by the discussion.
+For the root, response is user-facing prose; updated_summary is internal memory.
+Use Markdown naturally in response: paragraphs, useful headings, lists, tables for
+comparisons, source links, and fenced code with a language label. For mathematical
+notation use $...$ inline and $$ on separate lines for display equations. Keep
+formatting proportional to the discussion; greetings should stay brief.
+Use attention only for consequential research choices or real blockers, never to
+force the user into another text box. User replies arrive in this same conversation.
+Investigate the user's actual
 goal; never fabricate experiments, tool results, sources, observations or completion.
 Return the supplied structured schema. Your summary is durable scientific memory.
 Empirical results require a work_order; use evidence_proposals only for explicit
@@ -244,6 +277,8 @@ def _descendant(tx: Any, holon_id: str, ancestor_id: str, project_id: str) -> bo
 
 def _runnable(tx: Any, project: dict, holon: dict) -> bool:
     if project.get("status") != "active":
+        return False
+    if holon.get("chat_stopped"):
         return False
     seen: set[str] = set()
     current = holon
@@ -418,9 +453,11 @@ class HolonContextBuilder:
         parent = _owned(tx, "holons", holon["parent_id"], pid) if holon.get("parent_id") else None
         return {
             "instructions": INSTRUCTIONS,
+            "output_repair": "The previous decision was invalid. Follow the supplied schema exactly; arguments and scope use structured key/value entries, not JSON strings."
+            if holon.get("model_retry_count")
+            else None,
             "project": {
                 "id": pid,
-                "title": project.get("title"),
                 "goal": project.get("goal"),
                 "evidence_epoch": project.get("evidence_epoch", 0),
                 "settings": _public(project.get("settings", {})),
@@ -450,7 +487,22 @@ class HolonContextBuilder:
             "messages": _bounded(visible_messages, 7000),
             "retrieved_evidence": _bounded(historical, 7000),
             "human_guidance": _bounded(tx.list("human_inputs", project_id=pid)[-10:][::-1], 8000),
-            "recent_tool_results": _bounded(holon.get("recent_tool_results", [])[-4:], 6000),
+            "conversation": list(
+                reversed(
+                    _bounded(
+                        [
+                            {"role": m["role"], "text": m.get("text", ""), "id": m["id"]}
+                            for m in tx.list("messages", project_id=pid)[-24:][::-1]
+                        ],
+                        24000,
+                    )
+                )
+            )
+            if hid == project.get("root_holon_id")
+            else [],
+            "recent_tool_results": list(
+                reversed(_bounded(holon.get("recent_tool_results", [])[-4:][::-1], 14000))
+            ),
             "budget": {
                 "holon_available_usd": max(
                     0, _number(holon.get("budget_remaining")) - _number(holon.get("budget_reserved"))
@@ -1085,6 +1137,23 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
     tx.update(
         "holons", hid, {"summary": decision.updated_summary, "turn_count": holon.get("turn_count", 0) + 1}
     )
+    if (
+        decision.research_goal
+        and hid == project.get("root_holon_id")
+        and decision.research_goal != project.get("goal")
+    ):
+        tx.update("projects", pid, {"goal": decision.research_goal})
+        tx.update("holons", hid, {"goal": decision.research_goal})
+        tx.update(
+            "research_nodes",
+            holon["assigned_node_id"],
+            {"direction": decision.research_goal, "status": "active"},
+        )
+        tx.event(
+            pid,
+            "RESEARCH_DIRECTION_UPDATED",
+            {"previous": project.get("goal", ""), "direction": decision.research_goal, "holon_id": hid},
+        )
     if decision.response and hid == project.get("root_holon_id"):
         message = tx.create(
             "messages",
@@ -1262,6 +1331,17 @@ async def _call_model(
             - _number(project.get("budget_reserved")),
         )
         reserved = min(_number(settings.get("max_turn_cost_usd", 1)), available)
+        if (
+            settings.get("input_cost_per_million") is not None
+            and settings.get("output_cost_per_million") is not None
+        ):
+            from .integrations.model import input_token_bound
+
+            call_bound = (
+                input_token_bound(context, schema, INSTRUCTIONS) * settings["input_cost_per_million"]
+                + settings.get("max_output_tokens", 4096) * settings["output_cost_per_million"]
+            ) / 1_000_000
+            reserved = min(reserved, call_bound)
         if reserved <= 0:
             _block(tx, project, holon, "budget", "No unreserved research budget remains for a model call.")
             return None
@@ -1283,25 +1363,62 @@ async def _call_model(
             tx.event(
                 pid,
                 "MODEL_ERROR",
-                {"holon_id": hid, "error_type": type(exc).__name__, "usage_unknown": known is None},
+                {
+                    "holon_id": hid,
+                    "error_type": type(exc).__name__,
+                    "usage_unknown": known is None,
+                    "diagnostics": _public(getattr(exc, "diagnostics", [])),
+                },
             )
-            _block(
-                tx,
-                project,
-                holon,
-                "model_error",
-                "Model call failed. "
-                + (
-                    "Its reserved budget was charged conservatively because provider usage is unknown."
-                    if known is None
-                    else "Known provider usage was recorded."
-                ),
-            )
+            if isinstance(exc, asyncio.CancelledError) and holon.get("chat_stopped"):
+                tx.event(pid, "MODEL_CANCELLED", {"holon_id": hid, "usage_unknown": known is None})
+            elif (
+                not isinstance(exc, asyncio.CancelledError)
+                and expected_fence is not None
+                and _fence(project, holon) != expected_fence
+            ):
+                tx.event(pid, "STALE_TURN_DISCARDED", {"holon_id": hid, "cost_usd": actual})
+                if _runnable(tx, project, holon):
+                    tx.enqueue(pid, hid, "turn", {"reason": "steered_after_model_error"})
+            elif any(d.get("type") == "incomplete_response" for d in getattr(exc, "diagnostics", [])):
+                _block(
+                    tx,
+                    project,
+                    holon,
+                    "output_limit",
+                    "The model could not finish within its output limit. Increase Output tokens per turn in Research settings or lower the reasoning level, then retry. Usage was recorded; no actions were executed.",
+                )
+            elif (
+                type(exc).__name__ == "ModelResponseError"
+                and getattr(exc, "diagnostics", None)
+                and not holon.get("model_retry_count")
+            ):
+                tx.update("holons", hid, {"model_retry_count": 1})
+                tx.enqueue(pid, hid, "turn", {"reason": "repair_structured_output"})
+                tx.event(
+                    pid,
+                    "MODEL_RETRYING",
+                    {"holon_id": hid, "reason": "Correcting an invalid response format"},
+                )
+            else:
+                _block(
+                    tx,
+                    project,
+                    holon,
+                    "model_error",
+                    "Model call failed. "
+                    + (
+                        "Its reserved budget was charged conservatively because provider usage is unknown."
+                        if known is None
+                        else "Known provider usage was recorded."
+                    ),
+                )
         if isinstance(exc, asyncio.CancelledError):
             raise
         return None
     with store.transaction() as tx:
         _settle(tx, pid, hid, reserved, cost, usage)
+        tx.update("holons", hid, {"model_retry_count": 0})
         if response_id:
             tx.update("holons", hid, {"coordinator_session_id": response_id})
         tx.event(
@@ -1397,6 +1514,9 @@ async def execute_work_order(store: Any, holon_id: str, work_order: dict, tool_d
                 "holon_id": holon_id,
                 "node_id": node["id"],
                 "kind": work_order["kind"],
+                "summary": work_order.get("rationale", ""),
+                "query": work_order.get("arguments", {}).get("query"),
+                "url": work_order.get("arguments", {}).get("url"),
                 "decision_snapshot_id": work_order.get("decision_snapshot_id"),
             },
         )
@@ -1425,13 +1545,14 @@ async def execute_work_order(store: Any, holon_id: str, work_order: dict, tool_d
                 "WORK_ERROR",
                 {"holon_id": holon_id, "kind": work_order["kind"], "error_type": type(exc).__name__},
             )
-            _block(
-                tx,
-                project,
-                holon,
-                "tool_error",
-                "Research tool failed. Inspect the execution record before resuming.",
-            )
+            if not (isinstance(exc, asyncio.CancelledError) and holon.get("chat_stopped")):
+                _block(
+                    tx,
+                    project,
+                    holon,
+                    "tool_error",
+                    "Research tool failed. Inspect the execution record before resuming.",
+                )
         if isinstance(exc, asyncio.CancelledError):
             raise
         return {"status": "error", "cost_usd": actual}
@@ -1477,8 +1598,12 @@ async def execute_work_order(store: Any, holon_id: str, work_order: dict, tool_d
                 "holons",
                 holon_id,
                 {
-                    "recent_tool_results": _bounded(
-                        [*holon.get("recent_tool_results", [])[-3:], compact_result], 12000
+                    "recent_tool_results": list(
+                        reversed(
+                            _bounded(
+                                [compact_result, *holon.get("recent_tool_results", [])[-3:][::-1]], 24000
+                            )
+                        )
                     )
                 },
             )

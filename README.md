@@ -34,11 +34,15 @@ Use `--dev` for Next.js development, `--no-browser` to avoid opening a browser, 
 
 ## Connect and use
 
-1. Open **Settings & connections**. Enter an OpenAI key; Sapling stores it in the operating-system credential vault. The checked-in environment example contains a placeholder. Real keys are never returned by the API or stored in project records.
+1. Open **Settings → Connections**. Enter an OpenAI key; Sapling stores it in the operating-system credential vault. The checked-in environment example contains a placeholder. Real keys are never returned by the API or stored in project records.
 2. Choose a model and reasoning effort. The default is **GPT-5.4 nano with low reasoning**. Reviewed presets include editable input, cached-input and output prices; account availability is checked when credentials are configured. Custom model IDs are supported and require explicit prices. Project settings copy defaults when created; changing global defaults does not rewrite existing projects.
-3. Create a project, set its dollar budget and permission mode, and describe your research. The first message starts the root; **Start research** also starts a project. Later messages to a deliberately paused project are saved until resume.
-4. Inspect the research tree, holarchy, evidence, experiments, attention inbox and Ops event log. Attach PDFs or text documents as private project sources. On a research node, **Prioritize this direction** records explicit human preference and informs the root.
-5. Resolve requested permissions or scientific attention items. Pause a project or a subtree independently. In-flight model requests may finish and are still charged; their stale actions are discarded. Active experiments are cancelled on project/subtree pause.
+3. Create a project with a title only. Titles are excluded from model context. Start talking in **Converse**; a greeting or exploratory idea is sufficient. Project settings contain budget, permission and model controls.
+4. **Research** contains Direction, Tree, Knowledge, Researchers and Experiments. The living direction is maintained from conversation and has a visible revision history. **Activity** contains events and decision export. Attach PDFs or text documents as private sources.
+5. Reply to scientific questions in the same chat. Approve or deny permissions explicitly in inline action cards. Thinking, tool queries and elapsed time appear above the composer. Sending while busy steers the next step; **Stop** or Esc cancels the conversational researcher, leaving background researchers running. Project-wide pause remains in Research.
+
+Graphite is the default dark appearance. Settings offers three alternatives, including two light themes; `/designs` contains visual comparisons. Chat supports Markdown headings, lists, tables, task lists, source links, code copying and KaTeX equations. The application stays within the viewport while chat and research panels scroll internally.
+
+Output limits include reasoning tokens. The default allowance is 8,192 tokens; existing projects keep their configured limit. If a response exhausts it, lower reasoning or increase the limit in Research settings. Known usage is retained for failed and obsolete responses. A malformed structured decision gets one bounded repair attempt; no invalid actions are executed. Cancellation with unknown provider usage conservatively charges the request's calculated reservation, marked as estimated in Activity.
 
 Research content is stored locally. Model context is sent to the configured API provider, and search queries/source requests use external services. Uploaded private documents can enter model context when relevant. A local application is not an offline model.
 

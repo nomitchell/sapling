@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import "./workspace.css";
+import "katex/dist/katex.min.css";
 
 export const metadata: Metadata = {
   title: "Sapling — Research workspace",

@@ -31,9 +31,17 @@ from sqlalchemy import (
 )
 from sqlalchemy.pool import StaticPool
 
+_clock_lock = threading.Lock()
+_last_timestamp = datetime.min.replace(tzinfo=timezone.utc)
+
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    # Windows clocks can return the same instant for consecutive writes. Keep
+    # records ordered by insertion instead of random UUID order on those ties.
+    global _last_timestamp
+    with _clock_lock:
+        _last_timestamp = max(datetime.now(timezone.utc), _last_timestamp + timedelta(microseconds=1))
+        return _last_timestamp.isoformat()
 
 
 KINDS = "projects holons research_nodes research_references claims evidence claim_evidence artifacts experiments holon_messages peer_channels human_inputs attention_items decision_snapshots messages settings provider_credentials permission_grants".split()
@@ -170,6 +178,7 @@ class Store:
                     or project["status"] != "active"
                     or not holon
                     or holon["status"] in {"paused", "completed", "error", "blocked"}
+                    or holon.get("chat_stopped")
                 ):
                     continue
                 if row["holon_id"] in running:
@@ -199,12 +208,16 @@ class Store:
                 .values(lease_until=(datetime.now(timezone.utc) + timedelta(seconds=90)).isoformat())
             )
 
-    def finish(self, job_id: str, owner: str, error: str | None = None):
+    def finish(self, job_id: str, owner: str, error: str | None = None, *, cancelled: bool = False):
         with self.transaction() as tx:
             tx.conn.execute(
                 update(jobs)
                 .where(jobs.c.id == job_id, jobs.c.lease_owner == owner, jobs.c.state == "running")
-                .values(state="failed" if error else "completed", error=error, lease_until=None)
+                .values(
+                    state="cancelled" if cancelled else "failed" if error else "completed",
+                    error=error,
+                    lease_until=None,
+                )
             )
 
 
@@ -295,6 +308,13 @@ class Tx:
         }
         self.conn.execute(jobs.insert().values(**record))
         return record
+
+    def cancel_queued(self, holon_id: str):
+        self.conn.execute(
+            update(jobs)
+            .where(jobs.c.holon_id == holon_id, jobs.c.state == "queued")
+            .values(state="cancelled")
+        )
 
     def _index_holon(self, record):
         if self.conn.dialect.name != "postgresql":

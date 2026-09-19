@@ -19,10 +19,13 @@ This file distinguishes shipped behavior, validation, and remaining integration 
 
 ## Verified in this workspace
 
-- 82 backend API, runtime, worker and adapter tests passed against SQLite and actual Windows subprocesses (2026-09-19).
+- 94 backend API, runtime, worker and adapter tests passed against SQLite and actual Windows subprocesses (2026-09-19).
 - Frontend TypeScript and production build; dependency audit with no known issues at build time.
 - Browser project creation, root message persistence, live event updates, missing-credential attention and tree inspection.
 - Live keyless OpenAlex and DDGS searches.
+- Recovered the original saved robustness question with a real response and a revised research brief. A browser research session completed after live steering, with a three-bullet linked synthesis and explicit limits on abstract-level evidence. Public arXiv source opening and a linked verification response also succeeded. The session cost $0.08266039, including earlier failures and conservative cancellation accounting.
+- Browser checks of title-only creation, model/reasoning settings, light/dark appearance, greeting, thinking/tool activity, steering, stop/continue, and Markdown tables, equations and code copying. Long conversations scroll internally; document height remains the viewport height.
+- Fixed paused-root recovery, consecutive Windows timestamp ordering, newest-tool-result retention, stale-error steering, strict map encoding and selection of the final provider message. The original failure combined paused conversation state with invalid structured output; ordinary replies now stay in chat.
 - Live OpenAI coordinator connection using GPT-5.4 nano with low reasoning: 4,353 input tokens, 222 output tokens, $0.0011481 usage. It returned a valid decision and completed the isolated check. This validates the integration, not scientific research quality.
 
 ## Integration still requiring external readiness

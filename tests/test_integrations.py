@@ -127,7 +127,8 @@ async def test_model_credentials_structured_decisions_and_cost():
 @pytest.mark.asyncio
 async def test_flexible_decision_validated_and_invalid_usage_retained():
     async def create(**kwargs):
-        assert kwargs["text"]["format"]["type"] == "json_object"
+        assert kwargs["text"]["format"]["type"] == "json_schema"
+        assert kwargs["text"]["format"]["strict"]
         assert "json" in kwargs["input"][0]["content"].lower()
         assert kwargs["input"][0]["content"].endswith("{}")
         return SimpleNamespace(output_text='{"arguments": "not an object"}', id="bad-response", status="completed", usage=SimpleNamespace(input_tokens=10, output_tokens=10, input_tokens_details=None))

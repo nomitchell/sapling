@@ -53,6 +53,15 @@ def save_artifact(
 class Worker:
     def __init__(self, store, data_dir, vault):
         self.store, self.data_dir, self.vault = store, data_dir, vault
+        self.running = {}
+        self.user_stops = set()
+
+    async def stop_holon(self, holon_id):
+        task = self.running.get(holon_id)
+        if task and not task.done():
+            self.user_stops.add(holon_id)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def preflight(self, project):
         settings = project["settings"]
@@ -85,10 +94,24 @@ class Worker:
             await asyncio.gather(*active, return_exceptions=True)
 
     async def _perform_leased(self, job, owner):
+        self.running[job["holon_id"]] = asyncio.current_task()
+        with self.store.transaction() as tx:
+            tx.event(
+                job["project_id"],
+                "JOB_STARTED",
+                {"job_id": job["id"], "holon_id": job["holon_id"], "kind": job["kind"]},
+            )
         heartbeat = asyncio.create_task(self._heartbeat(job["id"], owner))
         try:
             await self.perform(job)
         except asyncio.CancelledError:
+            if job["holon_id"] in self.user_stops:
+                self.store.finish(job["id"], owner, cancelled=True)
+                with self.store.transaction() as tx:
+                    tx.event(
+                        job["project_id"], "JOB_CANCELLED", {"job_id": job["id"], "holon_id": job["holon_id"]}
+                    )
+                return
             self.store.finish(job["id"], owner, "Application stopped during this job; inspect before retry")
             with self.store.transaction() as tx:
                 tx.create(
@@ -124,8 +147,14 @@ class Worker:
         else:
             self.store.finish(job["id"], owner)
         finally:
+            self.running.pop(job["holon_id"], None)
+            self.user_stops.discard(job["holon_id"])
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
+            with self.store.transaction() as tx:
+                tx.event(
+                    job["project_id"], "JOB_FINISHED", {"job_id": job["id"], "holon_id": job["holon_id"]}
+                )
 
     async def _heartbeat(self, job_id, owner):
         while True:
@@ -136,7 +165,7 @@ class Worker:
         with self.store.transaction() as tx:
             project = tx.get("projects", job["project_id"])
             holon = tx.get("holons", job["holon_id"])
-        if not project or project["status"] != "active" or not holon:
+        if not project or project["status"] != "active" or not holon or holon.get("chat_stopped"):
             return
         if job["kind"] == "work_order":
             from .runtime import execute_work_order
@@ -181,7 +210,7 @@ class Worker:
                         project["id"], "ATTENTION_CREATED", {"attention_id": item["id"], "summary": problem}
                     )
             return
-        from .integrations.model import OpenAIModelRuntime
+        from .integrations.model import OpenAIModelRuntime, input_token_bound
         from .runtime import INSTRUCTIONS, run_turn
 
         settings = project["settings"]
@@ -197,12 +226,7 @@ class Worker:
         async def call_model(context, schema, config):
             # UTF-8 bytes upper-bound ordinary text tokenization conservatively;
             # reserve schema/instruction overhead before allowing a paid request.
-            input_bound = (
-                len(json.dumps(context, ensure_ascii=False).encode())
-                + len(INSTRUCTIONS.encode())
-                + len(json.dumps(schema.model_json_schema()).encode())
-                + 2048
-            )
+            input_bound = input_token_bound(context, schema, INSTRUCTIONS)
             input_cost = input_bound * settings["input_cost_per_million"] / 1_000_000
             cap = config.get("max_cost_usd", settings["max_turn_cost_usd"])
             affordable = int(max(0, cap - input_cost) * 1_000_000 / settings["output_cost_per_million"])
@@ -318,7 +342,15 @@ class Worker:
                     "cost_usd": 0,
                 }
             tx.event(
-                pid, "WORK_ASSIGNED", {"holon_id": holon["id"], "kind": kind, "node_id": order["node_id"]}
+                pid,
+                "TOOL_STARTED",
+                {
+                    "holon_id": holon["id"],
+                    "kind": kind,
+                    "summary": order.get("rationale", ""),
+                    "query": args.get("query"),
+                    "url": args.get("url"),
+                },
             )
 
         if kind in {"search_literature", "search_web", "open_source"}:
@@ -372,7 +404,17 @@ class Worker:
                 )
                 # Discovery metadata is retained; it is not empirical support for a claim.
                 return {
-                    "summary": payload[:20000],
+                    "summary": f"Search for {args['query']}: {len(results)} results. These are discovery metadata; open relevant sources before treating them as evidence.",
+                    "results": [
+                        {
+                            "title": r.title,
+                            "url": r.url,
+                            "abstract": r.summary[:300],
+                            "year": r.year,
+                            "open_access_url": r.open_access_url,
+                        }
+                        for r in results
+                    ],
                     "cost_usd": 0,
                     "artifacts": [artifact["id"]],
                     "evidence": [
@@ -446,7 +488,9 @@ class Worker:
                 else {}
             )
             backend = backend_type(self.data_dir / "workspaces", **options)
-            workspace = await backend.create_workspace(pid, experiment["id"], source_dir=args.get("source_dir"))
+            workspace = await backend.create_workspace(
+                pid, experiment["id"], source_dir=args.get("source_dir")
+            )
             base = Path(workspace.path).resolve()
             files = args.get("files", {})
             if not isinstance(files, dict) or sum(len(str(v)) for v in files.values()) > 2_000_000:
@@ -505,7 +549,11 @@ class Worker:
             for entry in collected[:50]:
                 info = serialize(entry)
                 path = Path(info.get("path", info.get("uri", "")))
-                if path.is_file() and path.resolve().is_relative_to(base) and path.stat().st_size <= 20_000_000:
+                if (
+                    path.is_file()
+                    and path.resolve().is_relative_to(base)
+                    and path.stat().st_size <= 20_000_000
+                ):
                     artifact = save_artifact(
                         self.store,
                         self.data_dir,
@@ -532,7 +580,9 @@ class Worker:
                     experiment["id"],
                     {"status": status, "finished_at": now(), "result": payload, "artifact_ids": artifacts},
                 )
-                tx.event(pid, "EXPERIMENT_FINISHED", {"experiment_id": experiment["id"], "exit_code": exit_code})
+                tx.event(
+                    pid, "EXPERIMENT_FINISHED", {"experiment_id": experiment["id"], "exit_code": exit_code}
+                )
             return {
                 "summary": json.dumps(payload, default=str)[:16000],
                 "cost_usd": 0,

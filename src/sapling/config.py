@@ -24,7 +24,7 @@ class ProjectSettings(BaseModel):
     max_concurrent_holons: int = Field(default=4, ge=1, le=32)
     max_depth: int = Field(default=5, ge=1, le=20)
     experiment_timeout: int = Field(default=300, ge=1, le=86400)
-    max_output_tokens: int = Field(default=4096, ge=256, le=64000)
+    max_output_tokens: int = Field(default=8192, ge=256, le=64000)
     max_turn_cost_usd: float = Field(default=1, gt=0, le=1000)
     input_cost_per_million: float = Field(default=0.20, ge=0, le=10000)
     cached_input_cost_per_million: float | None = Field(default=0.02, ge=0, le=10000)

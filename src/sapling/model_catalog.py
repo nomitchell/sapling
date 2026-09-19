@@ -3,14 +3,71 @@
 Prices are standard USD per million text tokens, verified 2026-09-19 against
 the linked official model pages. Account availability is checked separately.
 """
+
 DEFAULT_MODEL = "gpt-5.4-nano"
 MODELS = [
-    {"id": "gpt-5.4-nano", "label": "GPT-5.4 nano · low cost", "reasoning_efforts": ["none", "low", "medium", "high", "xhigh"], "input_cost_per_million": 0.20, "cached_input_cost_per_million": 0.02, "output_cost_per_million": 1.25},
-    {"id": "gpt-5.4-mini", "label": "GPT-5.4 mini", "reasoning_efforts": ["none", "low", "medium", "high", "xhigh"], "input_cost_per_million": 0.75, "cached_input_cost_per_million": 0.075, "output_cost_per_million": 4.50},
-    {"id": "gpt-5-mini", "label": "GPT-5 mini", "reasoning_efforts": ["minimal", "low", "medium", "high"], "input_cost_per_million": 0.25, "cached_input_cost_per_million": 0.025, "output_cost_per_million": 2.00},
+    {
+        "id": "gpt-6-astra",
+        "label": "GPT-6 Astra",
+        "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"],
+        "input_cost_per_million": 10.0,
+        "cached_input_cost_per_million": 1.0,
+        "output_cost_per_million": 50.0,
+    },
+    {
+        "id": "gpt-5.6-sol",
+        "label": "GPT-5.6 Sol",
+        "reasoning_efforts": ["none", "low", "medium", "high", "xhigh", "max"],
+        "input_cost_per_million": 4.0,
+        "cached_input_cost_per_million": 0.4,
+        "output_cost_per_million": 20.0,
+    },
+    {
+        "id": "gpt-5.6-terra",
+        "label": "GPT-5.6 Terra",
+        "reasoning_efforts": ["none", "low", "medium", "high", "xhigh", "max"],
+        "input_cost_per_million": 2.0,
+        "cached_input_cost_per_million": 0.2,
+        "output_cost_per_million": 12.0,
+    },
+    {
+        "id": "gpt-5.6-luna",
+        "label": "GPT-5.6 Luna",
+        "reasoning_efforts": ["none", "low", "medium", "high", "xhigh", "max"],
+        "input_cost_per_million": 0.2,
+        "cached_input_cost_per_million": 0.02,
+        "output_cost_per_million": 1.2,
+    },
+    {
+        "id": "gpt-5.4-nano",
+        "label": "GPT-5.4 nano · low cost",
+        "reasoning_efforts": ["none", "low", "medium", "high", "xhigh"],
+        "input_cost_per_million": 0.20,
+        "cached_input_cost_per_million": 0.02,
+        "output_cost_per_million": 1.25,
+    },
+    {
+        "id": "gpt-5.4-mini",
+        "label": "GPT-5.4 mini",
+        "reasoning_efforts": ["none", "low", "medium", "high", "xhigh"],
+        "input_cost_per_million": 0.75,
+        "cached_input_cost_per_million": 0.075,
+        "output_cost_per_million": 4.50,
+    },
+    {
+        "id": "gpt-5-mini",
+        "label": "GPT-5 mini",
+        "reasoning_efforts": ["minimal", "low", "medium", "high"],
+        "input_cost_per_million": 0.25,
+        "cached_input_cost_per_million": 0.025,
+        "output_cost_per_million": 2.00,
+    },
 ]
 for entry in MODELS:
-    entry.update(price_verified_at="2026-09-19", source_url=f"https://developers.openai.com/api/docs/models/{entry['id']}")
+    entry.update(
+        price_verified_at="2026-09-19",
+        source_url=f"https://developers.openai.com/api/docs/models/{entry['id']}",
+    )
 
 
 def preset(model):

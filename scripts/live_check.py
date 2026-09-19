@@ -21,7 +21,7 @@ async def check(root):
     store = Store("sqlite:///" + (root / "validation.sqlite3").as_posix())
     app = create_app(store, data_dir=root, workers=False)
     with TestClient(app) as client:
-        project = client.post("/projects", json={"title": "Runtime integration validation", "goal": "Validate the coordinator connection without conducting research.", "settings": {"budget_total": 0.20, "max_turn_cost_usd": 0.10, "max_output_tokens": 4096, "max_concurrent_holons": 1}}).json()
+        project = client.post("/projects", json={"title": "Runtime integration validation", "settings": {"budget_total": 0.20, "max_turn_cost_usd": 0.10, "max_output_tokens": 4096, "max_concurrent_holons": 1}}).json()
         assert "id" in project, project
         client.post(f"/projects/{project['id']}/messages", json={"text": "This is a connection integration test, not a research task. Reply briefly that you can receive this message. Return no branches, work orders, claims, evidence, child holons, or attention. Complete this one-off check with a concise completion summary."})
         worker = Worker(store, root, CredentialVault())

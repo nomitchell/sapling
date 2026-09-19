@@ -409,7 +409,7 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
             if p.get("status") == "archived":
                 raise HTTPException(409, "This project is archived")
             if action == "resume" and not (p.get("research_invitation") or {}).get("accepted_human_input_id"):
-                raise HTTPException(409, "Agree to Sapling's invitation in Converse before starting pair research")
+                raise HTTPException(409, "Agree to Sapling's autoresearch invitation in Converse before starting")
             return set_research_state(tx, p, "paused" if action == "pause" else "running")
 
     @app.post("/projects/{pid}/pause")

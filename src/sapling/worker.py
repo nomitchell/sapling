@@ -273,11 +273,14 @@ class Worker:
         async def call_model(context, schema, config):
             # UTF-8 bytes upper-bound ordinary text tokenization conservatively;
             # reserve schema/instruction overhead before allowing a paid request.
-            input_bound = input_token_bound(context, schema, INSTRUCTIONS)
+            instructions = config.get("_instructions", INSTRUCTIONS)
+            output_limit = min(settings["max_output_tokens"], config.get("_max_output_tokens", settings["max_output_tokens"]))
+            input_bound = input_token_bound(context, schema, instructions)
             input_cost = input_bound * settings["input_cost_per_million"] / 1_000_000
             cap = config.get("max_cost_usd", settings["max_turn_cost_usd"])
             affordable = int(max(0, cap - input_cost) * 1_000_000 / settings["output_cost_per_million"])
-            if affordable < 256:
+            minimum_tokens = config.get("_minimum_output_tokens", 256)
+            if affordable < minimum_tokens:
                 error = ValueError(
                     "This turn's context exceeds its dollar reservation; increase max_turn_cost_usd"
                 )
@@ -286,8 +289,8 @@ class Worker:
             result = await model.turn(
                 context,
                 schema,
-                INSTRUCTIONS,
-                max_output_tokens=min(settings["max_output_tokens"], affordable),
+                instructions,
+                max_output_tokens=min(output_limit, affordable),
                 progress=config.get("_progress_callback"),
             )
             return {

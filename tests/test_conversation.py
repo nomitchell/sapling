@@ -12,10 +12,12 @@ from sapling.runtime import (
     ConversationSynthesis,
     HolonContextBuilder,
     HolonDecision,
+    InvitationIntent,
     NodeControl,
     ResearchControl,
     _runnable,
     apply_decision,
+    apply_invitation_intent,
     run_turn,
     terminate_conversation_scope,
 )
@@ -79,7 +81,7 @@ def test_chat_references_but_does_not_implicitly_resolve_attention(workspace):
     assert store.claim("test") is not None
 
 
-def test_pair_research_requires_invitation_then_later_agreement(workspace):
+def test_autoresearch_requires_invitation_then_model_assessed_agreement(workspace):
     client, store, p, _ = workspace
     client.post(f"/projects/{p['id']}/messages", json={"text": "Let us investigate robust generalization."})
     with store.transaction() as tx:
@@ -89,61 +91,96 @@ def test_pair_research_requires_invitation_then_later_agreement(workspace):
         apply_decision(tx, project, root, HolonDecision(
             updated_summary="We have a concrete question about robust generalization.",
             research_goal="Determine which mechanisms improve robust generalization efficiently.",
-            response="Should we start performing pair research?",
+            response="Should I start autoresearch mode?",
             research_control=ResearchControl(action="invite"),
         ), HolonContextBuilder().build(tx, root, project))
         CURRENT_SCOPE.reset(token)
         invited = tx.get("projects", p["id"])
         invitation = invited["research_invitation"]
         assert invited["research_state"] == "planning" and invitation["status"] == "pending"
-        apply_decision(tx, invited, tx.get("holons", p["root_holon_id"]), HolonDecision(
-            updated_summary="The invitation is pending human agreement.",
-            response="We can keep planning while you decide.",
-            research_control=ResearchControl(action="start", invitation_id=invitation["id"]),
-        ), HolonContextBuilder().build(tx, tx.get("holons", p["root_holon_id"]), invited))
         assert tx.get("projects", p["id"])["research_state"] == "planning"
-        assert tx.list("decision_snapshots", p["id"])[-1]["decision"]["research_control"] is None
     assert client.post(f"/projects/{p['id']}/resume").status_code == 409
-    message = client.post(f"/projects/{p['id']}/messages", json={"text": "Yes, start pair research."}).json()
+    message = client.post(f"/projects/{p['id']}/messages", json={"text": "Yes, start autoresearch mode."}).json()
     with store.transaction() as tx:
         project = tx.get("projects", p["id"])
         root = tx.get("holons", p["root_holon_id"])
         token = CURRENT_SCOPE.set(message_scope)
-        result = apply_decision(tx, project, root, HolonDecision(
-            updated_summary="The user agreed to begin continuous pair research.",
-            response="Starting pair research now.",
-            research_control=ResearchControl(
-                action="start", invitation_id=invitation["id"], human_input_id=message["human_input_id"]),
-            branch_proposals=[{
-                "key": "candidate",
-                "parent_node_id": root["assigned_node_id"],
-                "title": "Persistent candidate",
-                "direction": "Test the candidate after the chat turn closes",
-                "rationale": "The campaign needs persistent work",
-            }],
-            child_holon_requests=[{
-                "research_node_id": "candidate",
-                "objective": "Run the persistent candidate",
-                "requested_budget": 0.1,
-            }],
-            work_orders=[{
-                "node_id": root["assigned_node_id"],
-                "kind": "search_web",
-                "arguments": {"query": "defer this root search"},
-                "rationale": "The research coordinator should replan this after handoff",
-            }],
-        ), HolonContextBuilder().build(tx, root, project))
+        assert apply_invitation_intent(tx, project, root, InvitationIntent(
+            decision="accept", reason="The user explicitly agreed to start now."))
         CURRENT_SCOPE.reset(token)
         started = tx.get("projects", p["id"])
         assert started["research_state"] == "running"
         assert started["research_invitation"]["accepted_human_input_id"] == message["human_input_id"]
-        child = tx.get("holons", result["child_holon_ids"][0])
-        assert child["work_scope"] == "research"
-        assert result["work_order"] is None
-        terminate_conversation_scope(tx, p["id"], message_scope)
-        assert tx.get("holons", child["id"])["status"] == "active"
-        assert not tx.get("holons", child["id"]).get("terminated")
+        assert started["last_autoresearch_transition"]["human_input_id"] == message["human_input_id"]
         assert any(job["payload"].get("work_scope") == "research" for job in tx.jobs(p["id"]))
+
+
+@pytest.mark.asyncio
+async def test_invitation_gate_starts_before_the_normal_research_turn(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Investigate robust generalization."})
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        token = CURRENT_SCOPE.set("conversation:" + project["active_conversation_id"])
+        apply_decision(tx, project, root, HolonDecision(
+            updated_summary="A concrete campaign is ready.", research_goal="Test robust generalization mechanisms.",
+            response="Should I start autoresearch mode?", research_control=ResearchControl(action="invite"),
+        ), HolonContextBuilder().build(tx, root, project))
+        CURRENT_SCOPE.reset(token)
+    client.post(f"/projects/{p['id']}/messages", json={"text": "I trust your judgment. Let's start."})
+    seen = []
+
+    async def model(context, schema, settings):
+        seen.append((context, schema))
+        if schema is InvitationIntent:
+            return {"decision": {"decision": "accept", "reason": "The user explicitly authorizes starting now."}, "cost_usd": 0.001}
+        return {"decision": HolonDecision(
+            updated_summary="Autoresearch has started from the accepted plan.",
+            response="Autoresearch is underway.",
+        ).model_dump(), "cost_usd": 0.001}
+
+    with store.transaction() as tx:
+        scope = "conversation:" + tx.get("projects", p["id"])["active_conversation_id"]
+        project, root = tx.get("projects", p["id"]), tx.get("holons", p["root_holon_id"])
+        assert _runnable(tx, project, root, scope), (project, root, scope)
+    result = await run_turn(store, p["root_holon_id"], model, None, scope=scope)
+    assert result["status"] == "autoresearch_started", (result, seen)
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        assert project["research_state"] == "running"
+        assert project["research_invitation"]["status"] == "accepted"
+        assert any(event["type"] == "AUTORESEARCH_STARTED" for event in tx.history(p["id"]))
+    await run_turn(store, p["root_holon_id"], model, None, scope="research")
+    assert seen[0][1] is InvitationIntent
+    assert seen[1][0]["project"]["research_state"] == "running"
+    assert seen[1][0]["project"]["last_autoresearch_transition"]["decision"] == "accept"
+
+
+@pytest.mark.parametrize("decision", ["decline", "continue_planning", "unclear"])
+def test_nonaccepting_invitation_intent_keeps_project_in_planning(workspace, decision):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Investigate robust generalization."})
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        token = CURRENT_SCOPE.set("conversation:" + project["active_conversation_id"])
+        apply_decision(tx, project, root, HolonDecision(
+            updated_summary="A concrete campaign is ready.", research_goal="Test robust generalization mechanisms.",
+            response="Should I start autoresearch mode?", research_control=ResearchControl(action="invite"),
+        ), HolonContextBuilder().build(tx, root, project))
+        CURRENT_SCOPE.reset(token)
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Let's think about this a little longer."})
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        scope = "conversation:" + project["active_conversation_id"]
+        token = CURRENT_SCOPE.set(scope)
+        assert not apply_invitation_intent(tx, project, root, InvitationIntent(decision=decision, reason="Not a present-tense authorization."))
+        CURRENT_SCOPE.reset(token)
+        updated = tx.get("projects", p["id"])
+        assert updated["research_state"] == "planning"
+        assert updated["research_invitation"]["status"] == ("declined" if decision == "decline" else "pending")
 
 
 def test_research_lifecycle_control_must_match_human_words(workspace):

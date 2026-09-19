@@ -9,6 +9,8 @@ from sapling.integrations.model import decode_wire, strict_wire_schema
 from sapling.runtime import (
     CURRENT_SCOPE,
     AttentionResolution,
+    BranchProposal,
+    ChildHolonRequest,
     ConversationSynthesis,
     HolonContextBuilder,
     HolonDecision,
@@ -155,6 +157,95 @@ async def test_invitation_gate_starts_before_the_normal_research_turn(workspace)
     assert seen[0][1] is InvitationIntent
     assert seen[1][0]["project"]["research_state"] == "running"
     assert seen[1][0]["project"]["last_autoresearch_transition"]["decision"] == "accept"
+
+
+@pytest.mark.asyncio
+async def test_autoresearch_handoff_closes_old_conversation_after_initial_branches(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Investigate robust generalization."})
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        token = CURRENT_SCOPE.set("conversation:" + project["active_conversation_id"])
+        apply_decision(tx, project, root, HolonDecision(
+            updated_summary="A campaign is ready.",
+            research_goal="Identify mechanisms for robust generalization.",
+            response="Should I start autoresearch mode?",
+            research_control=ResearchControl(action="invite"),
+        ), HolonContextBuilder().build(tx, root, project))
+        CURRENT_SCOPE.reset(token)
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Yes, start."})
+
+    async def model(context, schema, settings):
+        if schema is InvitationIntent:
+            return {"decision": {"decision": "accept", "reason": "The user clearly authorizes starting now."}, "cost_usd": 0.001}
+        return {"decision": HolonDecision(
+            updated_summary="Three initial branches are active.",
+            response="Internal setup details.",
+            user_report="Autoresearch has started with a theory branch. I am here for steering while it runs.",
+            branch_proposals=[BranchProposal(
+                key="theory", parent_node_id="root", title="Theory branch",
+                direction="Test the governing mechanism.", rationale="A separable theory check.",
+                estimated_cost=0.1, value=0.8, confidence=0.4,
+            )],
+            child_holon_requests=[ChildHolonRequest(
+                research_node_id="theory", objective="Develop the theory check.", requested_budget=0.1,
+            )],
+        ).model_dump(), "cost_usd": 0.001}
+
+    with store.transaction() as tx:
+        scope = "conversation:" + tx.get("projects", p["id"])["active_conversation_id"]
+    assert (await run_turn(store, p["root_holon_id"], model, None, scope=scope))["status"] == "autoresearch_started"
+    await run_turn(store, p["root_holon_id"], model, None, scope="research")
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        request = project["conversation_requests"][project["active_conversation_id"]]
+        messages = tx.list("messages", p["id"])
+        assert request["state"] == "completed"
+        assert project["autoresearch_handoff"]["status"] == "running"
+        assert any(m.get("text", "").startswith("Autoresearch has started") and m.get("channel") == "answer" for m in messages)
+        assert not any(
+            job["state"] == "queued" and job["payload"].get("work_scope") == scope
+            for job in tx.jobs(p["id"])
+        )
+
+
+def test_only_fresh_direct_child_reports_can_bubble_to_converse(workspace):
+    _, store, p, _ = workspace
+    with store.transaction() as tx:
+        root = tx.get("holons", p["root_holon_id"])
+        tx.update("projects", p["id"], {
+            "research_state": "running",
+            "research_invitation": {"accepted_human_input_id": "accepted"},
+        })
+        child_node = tx.create("research_nodes", {
+            "project_id": p["id"], "parent_id": root["assigned_node_id"],
+            "owning_holon_id": root["id"], "title": "Child", "direction": "Check a result",
+            "status": "completed", "value_estimate": 0.7, "estimated_cost": 0.1,
+        })
+        child = tx.create("holons", {
+            "project_id": p["id"], "parent_id": root["id"], "assigned_node_id": child_node["id"],
+            "status": "completed", "work_scope": "research", "goal": "Check a result",
+        })
+        tx.create("holon_messages", {
+            "project_id": p["id"], "sender_holon_id": child["id"], "recipient_holon_id": root["id"],
+            "kind": "child_report", "summary": "The decisive result arrived.",
+            "node_refs": [child_node["id"]], "importance": 0.8,
+        })
+        project = tx.get("projects", p["id"])
+        token = CURRENT_SCOPE.set("research")
+        try:
+            apply_decision(tx, project, root, HolonDecision(
+                updated_summary="Integrated the child result.", user_report="The child result changes our next step.",
+            ), HolonContextBuilder().build(tx, root, project))
+            apply_decision(tx, tx.get("projects", p["id"]), tx.get("holons", root["id"]), HolonDecision(
+                updated_summary="No new report.", user_report="This must not repeat.",
+            ), HolonContextBuilder().build(tx, tx.get("holons", root["id"]), tx.get("projects", p["id"])))
+        finally:
+            CURRENT_SCOPE.reset(token)
+        answers = [m for m in tx.list("messages", p["id"]) if m.get("channel") == "answer"]
+        assert [m["text"] for m in answers] == ["The child result changes our next step."]
+        assert tx.list("holon_messages", p["id"], recipient_holon_id=root["id"])[0].get("consumed_at")
 
 
 @pytest.mark.parametrize("decision", ["decline", "continue_planning", "unclear"])

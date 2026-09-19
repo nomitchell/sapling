@@ -29,6 +29,7 @@ export type Project = {
   research_state?: "planning" | "running" | "paused";
   active_conversation_id?: string | null;
   conversation_requests?: Record<string, { state: string }>;
+  autoresearch_handoff?: { status?: "setting_up" | "running"; conversation_id?: string } | null;
   settings: ResearchSettings; budget_total: number; budget_spent: number;
   root_holon_id?: string; created_at: string;
 };

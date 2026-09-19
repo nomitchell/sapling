@@ -205,6 +205,7 @@ class NodeControl(Record):
 class HolonDecision(Record):
     response: str | None = None
     progress_note: str | None = None
+    user_report: str | None = Field(default=None, max_length=12000)
     updated_summary: str
     research_goal: str | None = None
     research_control: ResearchControl | None = None
@@ -383,6 +384,15 @@ only through its exact-action approval control, never through these decisions.
 Human lifecycle, node, and attention controls are valid only in a conversational
 request grounded in the latest human input. Continuous research must leave all of
 those fields empty; it cannot infer human authorization from earlier conversation.
+Child reports move to their direct parent through shared evidence and parent messages.
+For the root during continuous autoresearch, use user_report only for a concise,
+material human update: a direct child resolved an important question, a result changes
+candidate selection, a decision needs human judgment, or a campaign milestone is reached.
+Otherwise leave user_report null and continue through nodes, evidence, artifacts, and
+parent messages. Do not turn every tool result or child completion into chat prose.
+When autoresearch_handoff.status is "setting_up", create or delegate the initial
+non-overlapping branches and return one concise user_report that says what has started.
+Do not run root-local tools in that setup turn.
 Use node_controls with a referenced node and human_input_id for explicit guidance,
 delegation, pause, resume or termination. When the human explicitly asks to delegate
 an existing campaign node, use action="delegate"; this creates a persistent campaign
@@ -643,7 +653,11 @@ class HolonContextBuilder:
             )
         ]
         local = [e for e in evidence if e.get("producer_holon_id") == hid][-12:][::-1]
-        messages = tx.list("holon_messages", project_id=pid, recipient_holon_id=hid)[-16:][::-1]
+        messages = [
+            message
+            for message in tx.list("holon_messages", project_id=pid, recipient_holon_id=hid)
+            if not message.get("consumed_at")
+        ][-16:][::-1]
         visible_messages = []
         for message in messages:
             referenced = [_owned(tx, "claims", cid, pid) for cid in message.get("claim_refs", [])]
@@ -707,6 +721,7 @@ class HolonContextBuilder:
                 "research_state": project.get("research_state", "running"),
                 "research_invitation": project.get("research_invitation"),
                 "last_autoresearch_transition": project.get("last_autoresearch_transition"),
+                "autoresearch_handoff": project.get("autoresearch_handoff"),
                 "last_research_control": project.get("last_research_control"),
                 "evidence_epoch": project.get("evidence_epoch", 0),
                 "settings": _public(project.get("settings", {})),
@@ -1034,6 +1049,7 @@ def apply_invitation_intent(
     })
     if assessment.decision != "accept":
         return False
+    scope = "conversation:" + request["id"]
     transition = {
         "invitation_id": invitation.get("id"),
         "human_input_id": human["id"],
@@ -1041,13 +1057,86 @@ def apply_invitation_intent(
         "reason": assessment.reason,
         "created_at": _now().isoformat(),
     }
-    updated = tx.update("projects", project["id"], {"last_autoresearch_transition": transition})
+    update_request(
+        tx,
+        project["id"],
+        scope,
+        {"state": "handing_off", "control_epoch": request.get("control_epoch", 0) + 1},
+    )
+    tx.cancel_queued(holon["id"], scope)
+    setup = tx.create(
+        "messages",
+        {
+            "project_id": project["id"],
+            "holon_id": holon["id"],
+            "role": "assistant",
+            "channel": "progress",
+            "text": "Starting autoresearch: setting up the initial research branches.",
+            "work_scope": scope,
+        },
+    )
+    tx.event(project["id"], "AUTORESEARCH_SETUP_STARTED", {
+        "holon_id": holon["id"],
+        "message_id": setup["id"],
+        "work_scope": scope,
+    })
+    updated = tx.update(
+        "projects",
+        project["id"],
+        {
+            "last_autoresearch_transition": transition,
+            "autoresearch_handoff": {
+                "status": "setting_up",
+                "conversation_id": request["id"],
+                "human_input_id": human["id"],
+                "started_at": _now().isoformat(),
+            },
+        },
+    )
     set_research_state(tx, updated, "running", human_input_id=human["id"])
     tx.event(project["id"], "AUTORESEARCH_STARTED", {
         "holon_id": holon["id"],
         "invitation_id": invitation.get("id"),
         "human_input_id": human["id"],
     })
+    return True
+
+
+def complete_autoresearch_handoff(tx: Any, project_id: str, holon_id: str) -> bool:
+    """End setup as one visible conversational handoff, then leave research autonomous."""
+    project = tx.get("projects", project_id)
+    handoff = (project or {}).get("autoresearch_handoff") or {}
+    if (
+        not project
+        or handoff.get("status") != "setting_up"
+        or holon_id != project.get("root_holon_id")
+    ):
+        return False
+    conversation_id = handoff.get("conversation_id")
+    if not isinstance(conversation_id, str):
+        return False
+    scope = "conversation:" + conversation_id
+    request = conversation_request(project, scope)
+    if request and request.get("state") == "handing_off":
+        update_request(tx, project_id, scope, {"state": "completed"})
+    tx.cancel_queued(holon_id, scope)
+    terminate_conversation_scope(tx, project_id, scope)
+    tx.update(
+        "projects",
+        project_id,
+        {
+            "autoresearch_handoff": {
+                **handoff,
+                "status": "running",
+                "completed_at": _now().isoformat(),
+            }
+        },
+    )
+    tx.event(
+        project_id,
+        "AUTORESEARCH_HANDOFF_COMPLETE",
+        {"holon_id": holon_id, "work_scope": scope},
+    )
     return True
 
 
@@ -1632,17 +1721,34 @@ def _complete(
             },
         )
         if notify_parent:
-            tx.create(
+            evidence_refs = list(dict.fromkeys(
+                evidence_id
+                for result in current.get("recent_tool_results", [])
+                for evidence_id in result.get("published_evidence_ids", [])
+                if isinstance(evidence_id, str)
+            ))[:12]
+            report = tx.create(
                 "holon_messages",
                 {
                     "project_id": pid,
                     "sender_holon_id": holon["id"],
                     "recipient_holon_id": parent["id"],
+                    "kind": "child_report",
                     "summary": completion.summary,
                     "claim_refs": [],
-                    "evidence_refs": [],
+                    "evidence_refs": evidence_refs,
                     "node_refs": [holon["assigned_node_id"]],
                     "importance": 0.7,
+                },
+            )
+            tx.event(
+                pid,
+                "CHILD_REPORT_READY",
+                {
+                    "message_id": report["id"],
+                    "child_holon_id": holon["id"],
+                    "parent_holon_id": parent["id"],
+                    "node_id": holon["assigned_node_id"],
                 },
             )
         parent = _owned(tx, "holons", parent["id"], pid)
@@ -1770,6 +1876,17 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
         and project.get("research_state") == "running"
     )
     allocation_scope = "research" if transition_to_research else work_scope(holon)
+    handoff = project.get("autoresearch_handoff") or {}
+    handoff_setting_up = bool(
+        hid == project.get("root_holon_id")
+        and allocation_scope == "research"
+        and handoff.get("status") == "setting_up"
+    )
+    if handoff_setting_up and decision.work_orders:
+        # The setup response starts durable branches. Root-local reads belong
+        # to the next campaign turn so setup has one clear completion point.
+        decision = decision.model_copy(update={"work_orders": []})
+        tx.event(pid, "AUTORESEARCH_SETUP_DEFERRED_ROOT_WORK", {"holon_id": hid})
     if transition_to_research and decision.work_orders:
         # The acceptance turn is still a bounded conversation. Persistent
         # candidate workers created by it cross into research scope, while any
@@ -2253,7 +2370,32 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
             },
         )
         tx.event(pid, "ASSISTANT_MESSAGE", {"message_id": note["id"], "holon_id": hid})
-    if decision.response and hid == project.get("root_holon_id"):
+    inbound_reports = [
+        message
+        for message in tx.list("holon_messages", project_id=pid, recipient_holon_id=hid)
+        if not message.get("consumed_at")
+    ]
+    direct_reports = [
+        message
+        for message in inbound_reports
+        if message.get("kind") == "child_report"
+        and (tx.get("holons", message.get("sender_holon_id")) or {}).get("parent_id") == hid
+        and float(message.get("importance", 0)) >= 0.7
+    ]
+    report_text = None
+    if handoff_setting_up:
+        report_text = decision.user_report or decision.response or "Autoresearch is now running. I started the initial research branches and will bring material results back here for steering."
+    elif decision.user_report and hid == project.get("root_holon_id") and work_scope(holon) == "research":
+        if direct_reports:
+            report_text = decision.user_report
+        else:
+            tx.event(pid, "USER_REPORT_DEFERRED", {
+                "holon_id": hid,
+                "reason": "no_fresh_material_direct_child_report",
+            })
+    if decision.response and hid == project.get("root_holon_id") and not (
+        handoff_setting_up and report_text == decision.response
+    ):
         message = tx.create(
             "messages",
             {
@@ -2277,6 +2419,45 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
             },
         )
         tx.event(pid, "ASSISTANT_MESSAGE", {"message_id": message["id"], "holon_id": hid})
+    if report_text:
+        report_nodes = sorted(
+            {
+                node_id
+                for message in direct_reports
+                for node_id in message.get("node_refs", [])
+            }
+        )
+        report_evidence = sorted(
+            {
+                evidence_id
+                for message in direct_reports
+                for evidence_id in message.get("evidence_refs", [])
+            }
+        )
+        report = tx.create(
+            "messages",
+            {
+                "project_id": pid,
+                "holon_id": hid,
+                "role": "assistant",
+                "channel": "answer",
+                "text": report_text,
+                "node_ids": report_nodes,
+                "evidence_ids": report_evidence,
+                "work_scope": "research" if handoff_setting_up else work_scope(holon),
+            },
+        )
+        tx.event(
+            pid,
+            "REPORT_BUBBLED_TO_CONVERSE",
+            {
+                "message_id": report["id"],
+                "holon_id": hid,
+                "node_ids": report_nodes,
+                "evidence_ids": report_evidence,
+                "handoff": handoff_setting_up,
+            },
+        )
 
     selected: dict | None = None
     children: list[str] = []
@@ -2507,6 +2688,8 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
             "selected_work": selected is not None,
         },
     )
+    for message in inbound_reports:
+        tx.update("holon_messages", message["id"], {"consumed_at": _now().isoformat()})
     return {
         "work_order": selected,
         "published_evidence_ids": published,
@@ -2885,6 +3068,10 @@ async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *
                     tx.enqueue(pid, holon_id, "turn", {"reason": "stale_context"})
                 return {"status": "stale", "cost_usd": cost, "usage": usage}
             applied = apply_decision(tx, project, holon, decision, context)
+            if applied["child_holon_ids"]:
+                applied["autoresearch_handoff_complete"] = complete_autoresearch_handoff(
+                    tx, pid, holon_id
+                )
             tx.update("holons", holon_id, {"decision_retry_count": 0})
     except (RuntimeRejected, ValueError, TypeError, KeyError) as exc:
         with store.transaction() as tx:

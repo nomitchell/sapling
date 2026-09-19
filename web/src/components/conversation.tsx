@@ -82,9 +82,14 @@ export function Conversation({
     Array.isArray(data.stats.jobs) ? data.stats.jobs : []
   ) as RecordItem[];
   const scope = project.active_conversation_id ? `conversation:${project.active_conversation_id}` : null;
+  const settingUpAutoresearch = project.autoresearch_handoff?.status === "setting_up";
   const rootJobs = jobs.filter(job => {
     const payload = (job.payload || {}) as Record<string, unknown>;
-    return scope && payload.work_scope === scope && ["running", "queued"].includes(String(job.state));
+    const jobScope = String(payload.work_scope || "");
+    return ["running", "queued"].includes(String(job.state)) && (
+      (scope !== null && jobScope === scope) ||
+      (settingUpAutoresearch && jobScope === "research")
+    );
   });
   const busy =
     sending ||
@@ -300,7 +305,9 @@ export function Conversation({
     }
   }
   const stage =
-    activity?.type === "MODEL_RETRYING"
+    settingUpAutoresearch
+      ? "Setting up autoresearch"
+      : activity?.type === "MODEL_RETRYING"
       ? "Correcting response format"
       : activity?.type === "TOOL_STARTED"
         ? toolLabel(activity)

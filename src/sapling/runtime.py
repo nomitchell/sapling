@@ -1099,6 +1099,23 @@ def return_terminated_budgets(tx: Any, project_id: str) -> None:
 
 def terminate_conversation_scope(tx: Any, project_id: str, scope: str) -> None:
     """End temporary descendants and return still-active nodes to their campaign owner."""
+    for item in tx.list("attention_items", project_id=project_id, status="pending"):
+        if item.get("work_scope") != scope:
+            continue
+        tx.update(
+            "attention_items",
+            item["id"],
+            {
+                "status": "resolved",
+                "resolution": "Conversation ended; this scoped alert is no longer active.",
+                "resolved_at": _now().isoformat(),
+            },
+        )
+        tx.event(
+            project_id,
+            "ATTENTION_SUPERSEDED",
+            {"attention_id": item["id"], "scope": scope},
+        )
     scoped = [
         h
         for h in tx.list("holons", project_id=project_id)
@@ -1384,6 +1401,40 @@ def _transfer(tx: Any, project: dict, parent: dict, child: dict, amount: float, 
 def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision, context: dict) -> dict:
     """Apply a validated decision inside one transaction; reject it atomically."""
     pid, hid = project["id"], holon["id"]
+    ignored: list[str] = []
+    if decision.completion and (decision.work_orders or decision.child_holon_requests):
+        # Concrete new work is the unambiguous intent. Completion can only be
+        # reconsidered after that work returns.
+        decision = decision.model_copy(update={"completion": None})
+        ignored.append("completion_with_new_work")
+    request = conversation_request(project)
+    if (
+        request
+        and decision.research_control
+        and decision.research_control.action != "invite"
+        and decision.research_control.human_input_id != request.get("latest_human_input_id")
+    ):
+        # Lifecycle changes need fresh, explicit human authorization. A model
+        # repeating an old control must not discard otherwise useful work.
+        decision = decision.model_copy(update={"research_control": None})
+        ignored.append("ungrounded_research_control")
+    if request and decision.attention_resolutions:
+        human = tx.get("human_inputs", request.get("latest_human_input_id")) or {}
+        selected_attention = set(human.get("attention_ids", []))
+        selected_nodes = set(human.get("node_ids", []))
+        supported = []
+        for resolution in decision.attention_resolutions:
+            item = tx.get("attention_items", resolution.attention_id)
+            owner = tx.get("holons", (item or {}).get("holon_id"))
+            node_id = (item or {}).get("node_id") or (owner or {}).get("assigned_node_id")
+            if (item and item["id"] in selected_attention) or node_id in selected_nodes:
+                supported.append(resolution)
+            else:
+                ignored.append("unselected_attention_resolution")
+        if len(supported) != len(decision.attention_resolutions):
+            decision = decision.model_copy(update={"attention_resolutions": supported})
+    if ignored:
+        tx.event(pid, "DECISION_ACTIONS_IGNORED", {"holon_id": hid, "reasons": ignored})
     if not conversation_request(project) and (
         decision.research_control or decision.node_controls or decision.attention_resolutions
     ):
@@ -1408,8 +1459,6 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
     project = tx.get("projects", pid)
     aliases: dict[str, str] = {}
     published: list[str] = []
-    if decision.completion and (decision.work_orders or decision.child_holon_requests):
-        raise RuntimeRejected("Completion cannot also assign new work")
     if len({b.key for b in decision.branch_proposals}) != len(decision.branch_proposals):
         raise RuntimeRejected("Branch keys must be unique within a decision")
 
@@ -1560,7 +1609,7 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
             if n["id"] in visible
             and (n.get("value_estimate") is None or n.get("evidence_epoch", -1) != epoch)
         ]
-        if stale:
+        if stale and not conversation_request(project):
             raise RuntimeRejected("Visible stale branch values must be reassessed before allocation")
     candidate_actions = [
         {
@@ -1890,7 +1939,31 @@ async def _call_model(
             return None
         _reserve(tx, project, holon, reserved)
         settings["max_cost_usd"] = reserved
-        tx.event(pid, "MODEL_STARTED", {"holon_id": hid, "reserved_usd": reserved, "schema": schema.__name__})
+        started_event = tx.event(
+            pid,
+            "MODEL_STARTED",
+            {"holon_id": hid, "reserved_usd": reserved, "schema": schema.__name__},
+        )
+        stream_id = str(started_event["id"])
+
+    async def report_progress(progress: dict) -> None:
+        payload = {
+            "holon_id": hid,
+            "stream_id": stream_id,
+            "input_tokens": max(0, int(progress.get("input_tokens", 0))),
+            "output_tokens": max(0, int(progress.get("output_tokens", 0))),
+            "estimated": bool(progress.get("estimated", True)),
+            "phase": str(progress.get("phase", "thinking")),
+        }
+        if payload["phase"] not in {"thinking", "responding", "finalizing"}:
+            payload["phase"] = "thinking"
+        with store.transaction() as tx:
+            current_project = tx.get("projects", pid)
+            current_holon = tx.get("holons", hid)
+            if current_project and current_holon and _runnable(tx, current_project, current_holon):
+                tx.event(pid, "MODEL_STREAM", payload)
+
+    settings["_progress_callback"] = report_progress
     try:
         result = await model(context, schema, settings)
         decision, usage, cost, response_id = _result_parts(result)
@@ -1908,6 +1981,7 @@ async def _call_model(
                 "MODEL_ERROR",
                 {
                     "holon_id": hid,
+                    "stream_id": stream_id,
                     "error_type": type(exc).__name__,
                     "usage_unknown": known is None,
                     "diagnostics": _public(getattr(exc, "diagnostics", [])),
@@ -1972,6 +2046,7 @@ async def _call_model(
             "MODEL_TURN",
             {
                 "holon_id": hid,
+                "stream_id": stream_id,
                 "usage": _public(usage),
                 "cost_usd": cost,
                 "response_id": response_id,
@@ -2011,7 +2086,11 @@ async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *
         pid = project["id"]
     request = conversation_request(project, work_scope(holon))
     synthesis_only = bool(
-        request and request.get("tool_calls", 0) >= request.get("max_tool_calls", 6)
+        request
+        and (
+            request.get("tool_calls", 0) >= request.get("max_tool_calls", 6)
+            or request.get("model_calls", 0) >= request.get("max_model_calls", 10) - 1
+        )
     )
     schema = ConversationSynthesis if synthesis_only else HolonDecision
     result = await _call_model(store, pid, holon_id, model, context, schema, expected_fence=expected)
@@ -2091,6 +2170,7 @@ async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *
             if (decision.response or decision.completion) and not children:
                 tx.update("holons", holon_id, {"empty_turn_count": 0, "runtime_feedback": None})
                 update_request(tx, pid, work_scope(holon), {"state": "completed"})
+                terminate_conversation_scope(tx, pid, work_scope(holon))
             elif not decision.response and not applied["child_holon_ids"]:
                 count = int(holon.get("empty_turn_count", 0)) + 1
                 tx.update("holons", holon_id, {"empty_turn_count": count, "runtime_feedback":

@@ -83,6 +83,49 @@ async def test_baseten_real_sdk_request_and_decision_contract():
 
 
 @pytest.mark.asyncio
+async def test_baseten_stream_reports_incremental_then_exact_usage():
+    progress = []
+    wire = json.dumps(WIRE_DECISION)
+
+    async def handler(request):
+        body = json.loads(request.content)
+        assert body["stream"] is True
+        assert body["stream_options"] == {"include_usage": True}
+        events = [
+            {"id": "chatcmpl-streamed", "object": "chat.completion.chunk", "created": 1,
+             "model": body["model"], "choices": [{"index": 0, "finish_reason": None,
+             "delta": {"role": "assistant", "reasoning_content": "r" * 120}}]},
+            {"id": "chatcmpl-streamed", "object": "chat.completion.chunk", "created": 1,
+             "model": body["model"], "choices": [{"index": 0, "finish_reason": None,
+             "delta": {"content": wire}}]},
+            {"id": "chatcmpl-streamed", "object": "chat.completion.chunk", "created": 1,
+             "model": body["model"], "choices": [{"index": 0, "finish_reason": "stop", "delta": {}}]},
+            {"id": "chatcmpl-streamed", "object": "chat.completion.chunk", "created": 1,
+             "model": body["model"], "choices": [], "usage": {
+                 "prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200,
+                 "prompt_tokens_details": {"cached_tokens": 800},
+             }},
+        ]
+        payload = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+        return httpx.Response(200, text=payload, headers={"content-type": "text/event-stream"})
+
+    model = adapter(handler)
+    try:
+        result = await model.turn(
+            {}, Decision, "Research", progress=lambda update: progress.append(update)
+        )
+        assert result.decision.summary == WIRE_DECISION["summary"]
+        assert progress[0]["estimated"] is True and progress[0]["output_tokens"] == 0
+        assert any(item["estimated"] and item["output_tokens"] > 0 for item in progress)
+        assert progress[-1] == {
+            "input_tokens": 1000, "output_tokens": 200, "cached_input_tokens": 800,
+            "estimated": False, "phase": "finalizing",
+        }
+    finally:
+        await model.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("effort,enabled", [("none", False), ("high", True)])
 async def test_toggle_models_only_send_documented_thinking_control(effort, enabled):
     async def handler(request):

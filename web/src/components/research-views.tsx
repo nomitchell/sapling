@@ -393,14 +393,14 @@ export function Commons({
       <ViewHeading
         eyebrow="Shared knowledge"
         title="A growing body of understanding."
-        description="Claims, sources, and files — collected in one place, grounded in the research."
+        description="Claims, evidence, and research artifacts — collected in one place and grounded in the work."
       />
       <div className="data-toolbar">
         <div className="segmented">
           {[
             { id: "claims", name: "Claims", count: claims.length },
             { id: "evidence", name: "Evidence", count: evidence.length },
-            { id: "files", name: "Files", count: artifacts.length },
+            { id: "artifacts", name: "Artifacts", count: artifacts.length },
           ].map((item) => (
             <button
               className={section === item.id ? "active" : ""}
@@ -435,7 +435,7 @@ export function Commons({
                 ? "Understanding takes shape here."
                 : section === "evidence"
                   ? "A place for the evidence."
-                  : "Bring your own context."
+                  : "Research outputs live here."
           }
         >
           {query
@@ -444,7 +444,7 @@ export function Commons({
               ? "As research progresses, claims and their supporting evidence become a shared foundation."
               : section === "evidence"
                 ? "Papers, web sources, and experimental observations will appear here."
-                : "Attach documents from the workspace to make them available to your researchers."}
+                : "Graphs, experiment code, datasets, uploaded context, and finished reports will collect here as the work develops."}
         </Empty>
       ) : (
         <div className={`split-view ${selected ? "has-detail" : ""}`}>
@@ -468,7 +468,7 @@ export function Commons({
                       "filename",
                       "name",
                     ) ||
-                      `Research ${section === "claims" ? "claim" : "source"}`}
+                      `Research ${section === "claims" ? "claim" : section === "evidence" ? "source" : "artifact"}`}
                   </button>
                   {field(
                     item,
@@ -504,7 +504,7 @@ export function Commons({
                     {item.status && <Status value={item.status} />}
                   </div>
                 </div>
-                {section === "files" ? (
+                {section === "artifacts" ? (
                   <a
                     className="icon-button outlined"
                     href={`/api/artifacts/${item.id}/download`}

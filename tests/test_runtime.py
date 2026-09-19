@@ -249,6 +249,18 @@ def test_stale_values_require_reassessment_before_allocation(store):
     assert get(store, "research_nodes", "n")["evidence_epoch"] == 2
 
 
+def test_concrete_work_takes_precedence_over_conflicting_completion(store):
+    applied = apply(
+        store,
+        decision(
+            completion={"summary": "Prematurely done"},
+            work_orders=[work()],
+        ),
+    )
+    assert applied["work_order"]["node_id"] == "n"
+    assert "DECISION_ACTIONS_IGNORED" in event_types(store)
+
+
 @pytest.mark.asyncio
 async def test_stale_allocation_gets_one_repair_without_executing_work(store):
     with store.transaction() as tx:

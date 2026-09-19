@@ -29,6 +29,22 @@ import {
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Mark, Markdown } from "./ui";
 
+const COMPOSER_MAX_HEIGHT = 144;
+const COMPOSER_MIN_HEIGHT = 45;
+
+function resizeComposer(textarea: HTMLTextAreaElement) {
+  textarea.style.height = "0px";
+  textarea.style.overflowY = "hidden";
+  const contentHeight = textarea.scrollHeight;
+  textarea.style.height = `${Math.min(COMPOSER_MAX_HEIGHT, Math.max(COMPOSER_MIN_HEIGHT, contentHeight))}px`;
+  textarea.style.overflowY = contentHeight > COMPOSER_MAX_HEIGHT ? "auto" : "hidden";
+}
+
+function tokenCount(value: number) {
+  if (value < 1_000) return String(value);
+  return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}k`;
+}
+
 export function Conversation({
   project,
   data,
@@ -95,6 +111,7 @@ export function Conversation({
     .find((event) =>
       [
         "MODEL_STARTED",
+        "MODEL_STREAM",
         "MODEL_RETRYING",
         "TOOL_STARTED",
         "STALE_TURN_DISCARDED",
@@ -102,6 +119,32 @@ export function Conversation({
       ].includes(event.type),
     );
   const tools = turnEvents.filter((event) => event.type === "TOOL_STARTED");
+  const completedStreams = new Set(
+    turnEvents
+      .filter((event) => event.type === "MODEL_TURN")
+      .map((event) => String(event.payload.stream_id || "")),
+  );
+  const liveStream = [...turnEvents]
+    .reverse()
+    .find(
+      (event) =>
+        event.type === "MODEL_STREAM" &&
+        !completedStreams.has(String(event.payload.stream_id || "")),
+    );
+  const usage = turnEvents.reduce(
+    (total, event) => {
+      if (event.type !== "MODEL_TURN") return total;
+      const value = (event.payload.usage || {}) as Record<string, unknown>;
+      total.input += Number(value.input_tokens) || 0;
+      total.output += Number(value.output_tokens) || 0;
+      return total;
+    },
+    {
+      input: Number(liveStream?.payload.input_tokens) || 0,
+      output: Number(liveStream?.payload.output_tokens) || 0,
+      estimated: Boolean(liveStream?.payload.estimated),
+    },
+  );
   const timeline = conversationTimeline(data, project.root_holon_id);
   const started =
     turnEvents.find((event) => event.type === "JOB_STARTED")?.created_at ||
@@ -132,6 +175,11 @@ export function Conversation({
       });
   }, [data.messages.length, tools.length, atBottom]);
   useEffect(() => { if (visible) input.current?.focus(); }, [visible, reference?.nodeId]);
+  useEffect(() => {
+    const textarea = input.current;
+    if (!textarea) return;
+    resizeComposer(textarea);
+  }, [draft, visible]);
   async function send(event?: FormEvent) {
     event?.preventDefault();
     if (!draft.trim() || sending) return;
@@ -200,6 +248,12 @@ export function Conversation({
       ? "Correcting response format"
       : activity?.type === "TOOL_STARTED"
         ? toolLabel(activity)
+        : activity?.type === "MODEL_STREAM"
+          ? activity.payload.phase === "responding"
+            ? "Forming the next step"
+            : activity.payload.phase === "finalizing"
+              ? "Applying the result"
+              : "Thinking"
         : activity?.type === "STALE_TURN_DISCARDED"
           ? "Taking your latest message into account"
           : rootJobs.some((job) => job.state === "running")
@@ -216,6 +270,17 @@ export function Conversation({
       : busy && elapsed > 20
         ? "Still working. You can steer the conversation or stop this response."
         : "";
+  const progressMessages = data.messages.filter(
+    (message) =>
+      message.channel === "progress" &&
+      (!lastInput || message.created_at >= lastInput.created_at),
+  );
+  const runningSummary = progressMessages.at(-1)?.text ||
+    (activity?.type === "TOOL_STARTED" && hint
+      ? `${toolLabel(activity)}: ${hint}`
+      : stage === "Thinking"
+        ? "Working through the question and deciding what evidence or action is useful next."
+        : `${stage}.`);
   return (
     <section className="conversation" aria-label="Conversation with Sapling">
       <div
@@ -240,34 +305,7 @@ export function Conversation({
           )}
           {timeline.map((entry) =>
             entry.kind === "activity" ? (
-              <details className="turn-activity" key={entry.id}>
-                <summary>
-                  Thinking & actions <span>· {entry.items.length}</span>
-                </summary>
-                {entry.items.map((item) =>
-                  item.kind === "note" ? (
-                    <div
-                      className="activity-note"
-                      key={item.id}
-                      title={item.text}
-                    >
-                      {compactNote(item.text)}
-                    </div>
-                  ) : (
-                    <div key={item.id}>
-                      <span>{toolLabel(item.event)}</span>
-                      <small>
-                        {String(
-                          item.event.payload.query ||
-                            item.event.payload.url ||
-                            item.event.payload.summary ||
-                            "",
-                        )}
-                      </small>
-                    </div>
-                  ),
-                )}
-              </details>
+              <ActivitySummary items={entry.items} key={entry.id} />
             ) : (
               <article
                 key={entry.id}
@@ -325,17 +363,38 @@ export function Conversation({
           </button>
         )}
         {busy ? (
-          <div className="chat-activity" role="status" aria-live="polite">
-            <Loader2 size={14} className="spinning" />
-            <div>
+          <details className="live-thinking" role="status" aria-live="polite">
+            <summary>
+              <Loader2 size={14} className="spinning" />
               <strong>
                 {sending ? "Sending your message" : stage}
                 {busy && !sending && <span className="activity-dots">…</span>}
               </strong>
-              {hint && <small title={hint}>{hint}</small>}
+              <span
+                className="token-activity"
+                title="Tokens sent to and received from the model in this response"
+                aria-label={`${usage.input} input tokens and ${usage.output} output tokens`}
+              >
+                <span>↑ {usage.estimated ? "~" : ""}{tokenCount(usage.input)}</span>
+                <span>↓ {usage.estimated ? "~" : ""}{tokenCount(usage.output)}</span>
+              </span>
+              <time>{elapsed}s</time>
+              <ChevronDown size={13} className="thinking-chevron" />
+            </summary>
+            <div className="thinking-summary">
+              <p>{compactNote(runningSummary)}</p>
+              {activity?.type === "TOOL_STARTED" && hint && (
+                <div className="latest-action">
+                  <span>{toolLabel(activity)}</span>
+                  <small>{hint}</small>
+                </div>
+              )}
+              <small>
+                {tools.length ? `${tools.length} research action${tools.length === 1 ? "" : "s"}` : "Preparing the next step"}
+                {usage.output > 0 ? ` · ${tokenCount(usage.output)} tokens generated` : ""}
+              </small>
             </div>
-            <time>{elapsed}s</time>
-          </div>
+          </details>
         ) : problem ? (
           <div className="chat-activity error" role="alert">
             <AlertCircle size={15} />
@@ -390,9 +449,7 @@ export function Conversation({
             value={draft}
             onChange={(event) => {
               setDraft(event.target.value);
-              event.target.style.height = "auto";
-              event.target.style.height =
-                Math.min(180, event.target.scrollHeight) + "px";
+              resizeComposer(event.target);
             }}
             onKeyDown={(event) => {
               if (
@@ -572,6 +629,54 @@ function toolLabel(event: ResearchEvent) {
         retrieve_evidence: "Reviewing evidence",
       } as Record<string, string>
     )[String(event.payload.kind)] || "Working"
+  );
+}
+
+function ActivitySummary({ items }: { items: ActivityItem[] }) {
+  const notes = items.filter(
+    (item): item is Extract<ActivityItem, { kind: "note" }> => item.kind === "note",
+  );
+  const actions = items.filter(
+    (item): item is Extract<ActivityItem, { kind: "tool" }> => item.kind === "tool",
+  );
+  const latestNote = notes.at(-1);
+  const latestAction = actions.at(-1);
+  const headline = latestNote
+    ? compactNote(latestNote.text)
+    : latestAction
+      ? toolLabel(latestAction.event)
+      : "Thought through the next step";
+  const actionDetail = latestAction
+    ? String(
+        latestAction.event.payload.query ||
+          latestAction.event.payload.url ||
+          latestAction.event.payload.summary ||
+          "",
+      )
+    : "";
+
+  return (
+    <details className="turn-activity">
+      <summary>
+        <span>Thought process</span>
+        <strong>{headline}</strong>
+        <ChevronDown size={12} />
+      </summary>
+      <div className="thinking-summary">
+        {latestNote && <p>{compactNote(latestNote.text)}</p>}
+        {latestAction && (
+          <div className="latest-action">
+            <span>{toolLabel(latestAction.event)}</span>
+            {actionDetail && <small>{actionDetail}</small>}
+          </div>
+        )}
+        <small>
+          {notes.length ? `${notes.length} reasoning update${notes.length === 1 ? "" : "s"}` : ""}
+          {notes.length && actions.length ? " · " : ""}
+          {actions.length ? `${actions.length} research action${actions.length === 1 ? "" : "s"}` : ""}
+        </small>
+      </div>
+    </details>
   );
 }
 

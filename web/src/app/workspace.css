@@ -640,12 +640,99 @@ pre {
   font-variant-numeric: tabular-nums;
   font-size: 11px;
 }
+.token-activity {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+  color: color-mix(in srgb, var(--muted) 78%, transparent);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.15px;
+}
+.token-activity span + span {
+  padding-left: 7px;
+  border-left: 1px solid var(--border);
+}
 .chat-activity.error {
   color: var(--danger);
 }
 .chat-activity button {
   color: var(--accent);
   text-decoration: underline;
+}
+.live-thinking {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 10px 4px;
+  min-height: 35px;
+}
+.live-thinking > summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  list-style: none;
+}
+.live-thinking > summary::-webkit-details-marker,
+.turn-activity > summary::-webkit-details-marker {
+  display: none;
+}
+.live-thinking > summary > svg:first-child {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+.live-thinking > summary strong {
+  min-width: 0;
+  flex: 1;
+  color: var(--ink);
+  font-weight: 500;
+}
+.live-thinking time {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+.thinking-chevron {
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+.live-thinking[open] .thinking-chevron,
+.turn-activity[open] > summary > svg {
+  transform: rotate(180deg);
+}
+.thinking-summary {
+  margin: 10px 0 2px 22px;
+  padding: 1px 0 1px 13px;
+  border-left: 1px solid var(--border);
+  line-height: 1.55;
+}
+.thinking-summary p {
+  margin: 0 0 8px;
+  color: var(--ink);
+}
+.thinking-summary > small {
+  display: block;
+  margin-top: 8px;
+  color: color-mix(in srgb, var(--muted) 78%, transparent);
+  font-size: 10px;
+}
+.latest-action {
+  min-width: 0;
+}
+.latest-action span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+.latest-action small {
+  display: block;
+  overflow: hidden;
+  color: color-mix(in srgb, var(--muted) 80%, transparent);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .chat-composer {
   border: 1px solid var(--border);
@@ -663,8 +750,11 @@ pre {
   outline: 0;
   border: 0;
   padding: 0;
-  min-height: 48px;
-  max-height: 180px;
+  height: 45px;
+  min-height: 45px;
+  max-height: 144px;
+  overflow-y: hidden;
+  resize: none;
   line-height: 1.6;
   font-size: 14px;
   box-shadow: none;
@@ -1882,27 +1972,33 @@ pre {
   font-size: 12px;
 }
 .turn-activity summary {
-  cursor: pointer;
-}
-.turn-activity > div {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin: 12px 0;
-  padding-left: 12px;
-  border-left: 1px solid var(--line);
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
 }
-.turn-activity small {
-  overflow-wrap: anywhere;
-}
-.turn-activity summary span {
+.turn-activity summary > span {
+  flex-shrink: 0;
   color: var(--muted);
   font-size: 11px;
 }
-.turn-activity .activity-note {
+.turn-activity summary > strong {
+  min-width: 0;
+  overflow: hidden;
   color: var(--muted);
-  line-height: 1.6;
-  overflow-wrap: anywhere;
+  font-size: 11px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.turn-activity summary > svg {
+  flex-shrink: 0;
+  margin-left: auto;
+  transition: transform 0.15s ease;
+}
+.turn-activity .thinking-summary {
+  margin-left: 4px;
 }
 .jump-to-latest {
   display: flex;

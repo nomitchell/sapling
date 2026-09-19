@@ -288,6 +288,7 @@ class Worker:
                 schema,
                 INSTRUCTIONS,
                 max_output_tokens=min(settings["max_output_tokens"], affordable),
+                progress=config.get("_progress_callback"),
             )
             return {
                 "decision": result.decision.model_dump(mode="json"),

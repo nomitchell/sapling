@@ -42,6 +42,8 @@ def test_project_bootstrap_chat_and_isolation(app_client):
     tree = client.get(f"/projects/{p['id']}/tree").json()
     assert len(h) == len(tree) == 1
     assert h[0]["assigned_node_id"] == tree[0]["id"]
+    assert tree[0]["value_estimate"] == 0.5
+    assert tree[0]["value_confidence"] == 0.0
     r = client.post(f"/projects/{p['id']}/messages", json={"text": "Investigate this open question"})
     assert r.status_code == 201, r.text
     assert client.get(f"/projects/{other['id']}/messages").json() == []
@@ -106,6 +108,30 @@ def test_pause_resume_and_archive(app_client):
     assert client.get("/projects").json() == []
     with store.transaction() as tx:
         assert tx.get("projects", p["id"])["status"] == "archived"
+
+
+def test_retry_recovers_internal_decision_blocker(app_client):
+    client, store = app_client
+    p = project(client)
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Scope the literature"})
+    with store.transaction() as tx:
+        current = tx.get("projects", p["id"])
+        scope = "conversation:" + current["active_conversation_id"]
+        root = tx.get("holons", p["root_holon_id"])
+        tx.update("research_nodes", root["assigned_node_id"], {"value_estimate": None})
+        tx.update("holons", root["id"], {"status": "blocked", "blocked_reason": "decision_rejected"})
+        item = tx.create("attention_items", {
+            "project_id": p["id"], "holon_id": root["id"], "node_id": root["assigned_node_id"],
+            "type": "decision_rejected", "status": "pending", "pauses_subtree": True,
+            "work_scope": scope, "summary": "Internal decision failure",
+        })
+
+    assert client.post(f"/projects/{p['id']}/conversation/retry").status_code == 200
+    with store.transaction() as tx:
+        assert tx.get("attention_items", item["id"])["status"] == "resolved"
+        assert tx.get("holons", p["root_holon_id"])["status"] == "active"
+        assert tx.get("research_nodes", root["assigned_node_id"])["value_estimate"] == 0.5
+        assert any(event["type"] == "ATTENTION_SUPERSEDED" for event in tx.history(p["id"]))
 
 
 def test_permission_approval_cannot_be_replayed(app_client):

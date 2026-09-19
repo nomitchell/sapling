@@ -6,11 +6,13 @@ import {
   emptyData,
   errorText,
   loadEvents,
+  mergeResearchEvent,
   money,
   ConversationReference,
   Project,
   ProjectData,
   ResearchSettings,
+  ResearchEvent,
 } from "@/lib/api";
 import {
   ArrowRight,
@@ -74,6 +76,7 @@ export function Workspace() {
   const [theme, setTheme] = useAppearance();
   const selected = projects.find((item) => item.id === selectedId) || null;
   const selectedRef = useRef(selectedId);
+  const eventCursor = useRef("0");
   selectedRef.current = selectedId;
   const loadProjects = useCallback(async () => {
     const list = await api<Project[]>("/projects");
@@ -81,7 +84,7 @@ export function Workspace() {
     setOnline(true);
     return list;
   }, []);
-  const refreshData = useCallback(async (id: string) => {
+  const refreshData = useCallback(async (id: string, includeEvents = false) => {
     const paths = [
       "messages",
       "tree",
@@ -90,9 +93,9 @@ export function Workspace() {
       "evidence",
       "experiments",
       "attention",
-      "events",
       "stats",
       "artifacts",
+      ...(includeEvents ? ["events" as const] : []),
     ] as const;
     const results = await Promise.allSettled(
       paths.map((path) =>
@@ -108,7 +111,11 @@ export function Workspace() {
       else failure = errorText(result.reason);
     });
     setData((current) => ({ ...current, ...update }));
+    if (includeEvents && Array.isArray(update.events) && update.events.length) {
+      eventCursor.current = update.events.at(-1)?.id || "0";
+    }
     if (failure) setError(failure);
+    return update;
   }, []);
   const refresh = useCallback(() => {
     void loadProjects().catch(() => setOnline(false));
@@ -134,21 +141,35 @@ export function Workspace() {
     setError("");
     if (!selectedId) return;
     window.localStorage.setItem("sapling-project", selectedId);
-    void refreshData(selectedId);
+    let source: EventSource | undefined;
+    let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const source = new EventSource(`/api/projects/${selectedId}/events/stream`);
-    source.onopen = () => setConnected(true);
-    source.onerror = () => setConnected(false);
-    source.addEventListener("research", () => {
-      if (!timer)
-        timer = setTimeout(() => {
-          timer = undefined;
-          refresh();
-        }, 150);
-    });
+    eventCursor.current = "0";
+    void refreshData(selectedId, true).then(() => {
+      if (cancelled) return;
+      source = new EventSource(
+        `/api/projects/${selectedId}/events/stream?after=${eventCursor.current}`,
+      );
+      source.onopen = () => setConnected(true);
+      source.onerror = () => setConnected(false);
+      source.addEventListener("research", (message) => {
+        const event = JSON.parse((message as MessageEvent).data) as ResearchEvent;
+        eventCursor.current = event.id;
+        setData((current) => ({
+          ...current,
+          events: mergeResearchEvent(current.events, event),
+        }));
+        if (!timer)
+          timer = setTimeout(() => {
+            timer = undefined;
+            refresh();
+          }, 150);
+      });
+    }).catch((err) => setError(errorText(err)));
     const poll = setInterval(refresh, 5000);
     return () => {
-      source.close();
+      cancelled = true;
+      source?.close();
       clearInterval(poll);
       if (timer) clearTimeout(timer);
       setConnected(false);

@@ -110,7 +110,7 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
   return <div className="research-stage">
     <div className="canvas-heading">
       <div><span className="eyebrow">Research tree</span><h1>{project.goal ? "Following the question." : "Room for a good question."}</h1></div>
-      <button className="canvas-knowledge" onClick={onKnowledge}>Shared knowledge <span>{data.claims.length + data.evidence.length}</span><ChevronRight size={13} /></button>
+      <button className="canvas-knowledge" onClick={onKnowledge}>Shared knowledge <span>{data.claims.length + data.evidence.length + data.artifacts.length}</span><ChevronRight size={13} /></button>
     </div>
     <div className="research-viewport" ref={viewport} tabIndex={0} aria-label="Research tree canvas. Drag to pan. Use plus and minus to zoom."
       onPointerDown={startPan}

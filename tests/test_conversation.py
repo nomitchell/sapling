@@ -96,6 +96,13 @@ def test_pair_research_requires_invitation_then_later_agreement(workspace):
         invited = tx.get("projects", p["id"])
         invitation = invited["research_invitation"]
         assert invited["research_state"] == "planning" and invitation["status"] == "pending"
+        apply_decision(tx, invited, tx.get("holons", p["root_holon_id"]), HolonDecision(
+            updated_summary="The invitation is pending human agreement.",
+            response="We can keep planning while you decide.",
+            research_control=ResearchControl(action="start", invitation_id=invitation["id"]),
+        ), HolonContextBuilder().build(tx, tx.get("holons", p["root_holon_id"]), invited))
+        assert tx.get("projects", p["id"])["research_state"] == "planning"
+        assert tx.list("decision_snapshots", p["id"])[-1]["decision"]["research_control"] is None
     assert client.post(f"/projects/{p['id']}/resume").status_code == 409
     message = client.post(f"/projects/{p['id']}/messages", json={"text": "Yes, start pair research."}).json()
     with store.transaction() as tx:
@@ -274,11 +281,19 @@ def test_conversation_limit_cleanup_is_idempotent(workspace):
             "terminated": True, "goal": "Finished check", "work_scope": scope,
             "budget_remaining": 0.03, "budget_reserved": 0,
         })
+        alert = tx.create("attention_items", {
+            "project_id": p["id"], "holon_id": root["id"], "status": "pending",
+            "type": "tool_error", "pauses_subtree": True,
+            "summary": "A scoped tool failed", "work_scope": scope,
+        })
         before = root["budget_remaining"]
         terminate_conversation_scope(tx, p["id"], scope)
         terminate_conversation_scope(tx, p["id"], scope)
         assert tx.get("holons", child["id"])["budget_remaining"] == 0
         assert tx.get("holons", root["id"])["budget_remaining"] == pytest.approx(before + 0.03)
+        assert tx.get("attention_items", alert["id"])["status"] == "resolved"
+        superseded = [e for e in tx.history(p["id"]) if e["type"] == "ATTENTION_SUPERSEDED"]
+        assert len(superseded) == 1
 
 
 def test_conversation_contains_assistant_turns_and_latest_message(workspace):
@@ -565,6 +580,40 @@ async def test_bounded_conversation_forces_synthesis_after_six_tools(workspace):
         current = tx.get("projects", p["id"])
         request = current["conversation_requests"][current["active_conversation_id"]]
         assert request["state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_bounded_conversation_reserves_its_last_model_call_for_an_answer(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Investigate this and report back"})
+    with store.transaction() as tx:
+        current = tx.get("projects", p["id"])
+        scope = "conversation:" + current["active_conversation_id"]
+        request = current["conversation_requests"][current["active_conversation_id"]]
+        from sapling.runtime import update_request
+
+        update_request(tx, p["id"], scope, {**request, "model_calls": 9, "max_model_calls": 10})
+
+    observed = {}
+
+    async def model(context, schema, settings):
+        observed["schema"] = schema
+        return {
+            "decision": schema(
+                response="Here is the answer from the evidence gathered so far.",
+                updated_summary="Returned the bounded synthesis.",
+            ),
+            "usage": {},
+            "cost_usd": 0,
+        }
+
+    await run_turn(store, p["root_holon_id"], model, None, scope=scope)
+    assert observed["schema"] is ConversationSynthesis
+    with store.transaction() as tx:
+        current = tx.get("projects", p["id"])
+        request = current["conversation_requests"][current["active_conversation_id"]]
+        assert request["state"] == "completed"
+        assert tx.list("messages", project_id=p["id"])[-1]["text"].startswith("Here is the answer")
 
 
 def test_source_catalog_keeps_exact_citations_after_tool_history_rolls_off(workspace):

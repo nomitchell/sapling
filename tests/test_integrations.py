@@ -143,6 +143,45 @@ async def test_model_credentials_structured_decisions_and_cost():
 
 
 @pytest.mark.asyncio
+async def test_openai_stream_reports_progress_without_exposing_reasoning():
+    progress = []
+    response = SimpleNamespace(
+        output=[], output_text='{"summary":"done"}', id="response-streamed", status="completed",
+        usage=SimpleNamespace(
+            input_tokens=120, output_tokens=48,
+            input_tokens_details=SimpleNamespace(cached_tokens=10),
+        ),
+    )
+
+    class Stream:
+        def __aiter__(self):
+            return self._events().__aiter__()
+
+        async def _events(self):
+            yield SimpleNamespace(type="response.reasoning_summary_text.delta", delta="r" * 300)
+            yield SimpleNamespace(type="response.output_text.delta", delta='{"summary":"done"}')
+            yield SimpleNamespace(type="response.completed", response=response)
+
+    async def create(**kwargs):
+        assert kwargs["stream"] is True
+        assert kwargs["text"]["format"]["type"] == "json_schema"
+        return Stream()
+
+    model = OpenAIModelRuntime(
+        "sk-test-real-shaped", "configured-model",
+        client=SimpleNamespace(responses=SimpleNamespace(create=create), close=lambda: None),
+        input_cost_per_million=1, output_cost_per_million=2,
+    )
+    result = await model.turn(
+        {}, StrictDecision, "Research", progress=lambda update: progress.append(update)
+    )
+    assert result.decision.summary == "done"
+    assert progress[0]["estimated"] is True
+    assert any(item["estimated"] and item["output_tokens"] > 0 for item in progress)
+    assert progress[-1]["input_tokens"] == 120 and progress[-1]["estimated"] is False
+
+
+@pytest.mark.asyncio
 async def test_flexible_decision_validated_and_invalid_usage_retained():
     async def create(**kwargs):
         assert kwargs["text"]["format"]["type"] == "json_schema"

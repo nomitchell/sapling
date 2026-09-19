@@ -17,7 +17,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import DATA_DIR, DATABASE_URL, ProjectSettings
 from .credentials import CredentialVault
 from .model_catalog import merge_settings
-from .store import Store
+from .store import Store, now
 
 
 class Input(BaseModel):
@@ -71,7 +71,7 @@ def wake(tx, project, holon_id=None):
 
 def record_conversation(tx, project, text, node_ids=None, attention_ids=None):
     """A message authorizes one bounded request, never a continuous campaign."""
-    from .runtime import update_request
+    from .runtime import terminate_conversation_scope, update_request
     pid = project["id"]
     node_ids, attention_ids = list(node_ids or []), list(attention_ids or [])
     for identifier in re.findall(r"\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b", text):
@@ -95,6 +95,8 @@ def record_conversation(tx, project, text, node_ids=None, attention_ids=None):
     request_id = project.get("active_conversation_id")
     request = project.get("conversation_requests", {}).get(request_id)
     if not request or request.get("state") != "active":
+        if request_id and request:
+            terminate_conversation_scope(tx, pid, "conversation:" + request_id)
         request_id = str(uuid4())
         requests = dict(project.get("conversation_requests", {}))
         available = max(0, project["budget_total"] - project.get("budget_spent", 0) - project.get("budget_reserved", 0))
@@ -111,6 +113,16 @@ def record_conversation(tx, project, text, node_ids=None, attention_ids=None):
         "human_input_id": human["id"], "node_ids": node_ids, "attention_ids": attention_ids,
         "work_scope": "conversation:" + request_id})
     root = tx.get("holons", project["root_holon_id"])
+    for item in tx.list("attention_items", pid, type="decision_rejected", status="pending"):
+        if item.get("holon_id") == root["id"]:
+            tx.update("attention_items", item["id"], {
+                "status": "resolved",
+                "resolution": "Superseded by the next conversational turn",
+                "resolved_at": now(),
+            })
+            tx.event(pid, "ATTENTION_SUPERSEDED", {"attention_id": item["id"]})
+    from .runtime import refresh_blockers
+    root = refresh_blockers(tx, pid, root["id"])
     tx.update("holons", root["id"], {"chat_stopped": False, "model_retry_count": 0,
         "empty_turn_count": 0, "decision_retry_count": 0, "runtime_feedback": None})
     tx.event(pid, "HUMAN_INPUT", {"message_id": message["id"], "human_input_id": human["id"],
@@ -293,8 +305,10 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                     "status": "active",
                     "visits": 0,
                     "budget_spent": 0,
-                    "value_estimate": None,
-                    "value_confidence": None,
+                    # A neutral prior lets the first conversational turn use the
+                    # root direction without inventing a comparative branch score.
+                    "value_estimate": 0.5,
+                    "value_confidence": 0.0,
                     "evidence_epoch": 0,
                     "estimated_cost": 1,
                 },
@@ -435,7 +449,7 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
 
     @app.post("/projects/{pid}/conversation/retry")
     def retry_conversation(pid: str):
-        from .runtime import update_request
+        from .runtime import refresh_blockers, update_request
         with store.transaction() as tx:
             p = require(tx, "projects", pid)
             inputs = tx.list("human_inputs", pid)
@@ -448,8 +462,24 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                 record_conversation(tx, p, human["text"], human.get("node_ids"), human.get("attention_ids"))
             else:
                 scope = "conversation:" + request_id
+                for item in tx.list("attention_items", pid, status="pending"):
+                    if item.get("type") == "decision_rejected" and item.get("work_scope") == scope:
+                        tx.update("attention_items", item["id"], {
+                            "status": "resolved",
+                            "resolution": "Superseded by automatic runtime recovery",
+                            "resolved_at": now(),
+                        })
+                        tx.event(pid, "ATTENTION_SUPERSEDED", {"attention_id": item["id"]})
                 update_request(tx, pid, scope, {"state": "active", "control_epoch": request.get("control_epoch", 0) + 1})
                 root = require(tx, "holons", p["root_holon_id"])
+                node = require(tx, "research_nodes", root["assigned_node_id"])
+                if node.get("value_estimate") is None:
+                    tx.update("research_nodes", node["id"], {
+                        "value_estimate": 0.5,
+                        "value_confidence": 0.0,
+                        "evidence_epoch": p.get("evidence_epoch", 0),
+                    })
+                root = refresh_blockers(tx, pid, root["id"])
                 tx.update("holons", root["id"], {"model_retry_count": 0, "empty_turn_count": 0,
                     "decision_retry_count": 0, "runtime_feedback": None})
                 tx.enqueue(pid, root["id"], "turn", {"reason": "conversation_retry", "work_scope": scope})

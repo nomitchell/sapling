@@ -47,9 +47,43 @@ export async function loadEvents(projectId: string): Promise<ResearchEvent[]> {
   while (true) {
     const batch = await api<ResearchEvent[]>(`/projects/${projectId}/events?after=${after}`);
     events.push(...batch);
-    if (batch.length < 250) return events;
+    if (batch.length < 250) return compactEvents(events);
     after = batch[batch.length - 1].id;
   }
+}
+
+export function mergeResearchEvent(events: ResearchEvent[], event: ResearchEvent) {
+  const streamId = String(event.payload.stream_id || "");
+  if (event.type === "MODEL_STREAM") {
+    return [...events.filter((item) =>
+      item.type !== "MODEL_STREAM" || String(item.payload.stream_id || "") !== streamId
+    ), event];
+  }
+  if (event.type === "MODEL_TURN" && streamId) {
+    return [...events.filter((item) =>
+      item.type !== "MODEL_STREAM" || String(item.payload.stream_id || "") !== streamId
+    ), event];
+  }
+  if (events.some((item) => item.id === event.id)) return events;
+  return [...events, event];
+}
+
+function compactEvents(events: ResearchEvent[]) {
+  const completed = new Set(
+    events
+      .filter((event) => event.type === "MODEL_TURN")
+      .map((event) => String(event.payload.stream_id || "")),
+  );
+  const lastLive = new Map<string, ResearchEvent>();
+  for (const event of events) {
+    if (event.type !== "MODEL_STREAM") continue;
+    const streamId = String(event.payload.stream_id || "");
+    if (!completed.has(streamId)) lastLive.set(streamId, event);
+  }
+  return [
+    ...events.filter((event) => event.type !== "MODEL_STREAM"),
+    ...lastLive.values(),
+  ].sort((a, b) => Number(a.id) - Number(b.id));
 }
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {

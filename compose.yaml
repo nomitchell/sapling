@@ -1,0 +1,29 @@
+name: sapling
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: sapling
+      POSTGRES_PASSWORD: sapling
+      POSTGRES_DB: sapling
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - research-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sapling -d sapling"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  search:
+    image: searxng/searxng:latest
+    ports:
+      - "127.0.0.1:8088:8080"
+    volumes:
+      - ./infra/searxng.yml:/etc/searxng/settings.yml:ro
+    environment:
+      SEARXNG_BASE_URL: http://localhost:8088/
+    restart: unless-stopped
+volumes:
+  research-db:

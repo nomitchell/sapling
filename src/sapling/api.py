@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -15,7 +16,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import DATA_DIR, DATABASE_URL, ProjectSettings
 from .credentials import CredentialVault
-from .model_catalog import DEFAULT_MODEL, MODELS, merge_settings
+from .model_catalog import merge_settings
 from .store import Store
 
 
@@ -36,10 +37,12 @@ class PatchProject(Input):
 
 class MessageInput(Input):
     text: str = Field(min_length=1, max_length=40000)
+    node_ids: list[str] = Field(default_factory=list, max_length=16)
+    attention_ids: list[str] = Field(default_factory=list, max_length=16)
 
 
 class CredentialInput(Input):
-    provider: Literal["openai", "openalex", "tavily"]
+    provider: Literal["openai", "openalex", "tavily", "baseten"]
     key: str = Field(min_length=5, max_length=1000)
 
 
@@ -63,13 +66,57 @@ def global_settings(tx):
 
 def wake(tx, project, holon_id=None):
     hid = holon_id or project["root_holon_id"]
-    holon = tx.get("holons", hid)
-    if holon and holon["status"] in {"blocked", "error", "awaiting_permission", "completed"}:
-        tx.update("holons", hid, {"status": "active"})
-        assigned = tx.get("research_nodes", holon["assigned_node_id"])
-        if assigned and assigned["status"] in {"completed", "abandoned"}:
-            tx.update("research_nodes", assigned["id"], {"status": "active"})
     return tx.enqueue(project["id"], hid, "turn", {})
+
+
+def record_conversation(tx, project, text, node_ids=None, attention_ids=None):
+    """A message authorizes one bounded request, never a continuous campaign."""
+    from .runtime import update_request
+    pid = project["id"]
+    node_ids, attention_ids = list(node_ids or []), list(attention_ids or [])
+    for identifier in re.findall(r"\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b", text):
+        for kind, refs in (("research_nodes", node_ids), ("attention_items", attention_ids)):
+            item = tx.get(kind, identifier)
+            if item and item["project_id"] == pid and identifier not in refs:
+                refs.append(identifier)
+    for kind, refs in (("research_nodes", node_ids), ("attention_items", attention_ids)):
+        for identifier in refs:
+            item = require(tx, kind, identifier)
+            if item["project_id"] != pid:
+                raise HTTPException(422, "References must belong to this project")
+    for identifier in attention_ids:
+        item = tx.get("attention_items", identifier)
+        owner = tx.get("holons", item.get("holon_id"))
+        nid = item.get("node_id") or (owner or {}).get("assigned_node_id")
+        if nid and nid not in node_ids:
+            node_ids.append(nid)
+    human = tx.create("human_inputs", {"project_id": pid, "text": text,
+        "node_ids": node_ids, "attention_ids": attention_ids})
+    request_id = project.get("active_conversation_id")
+    request = project.get("conversation_requests", {}).get(request_id)
+    if not request or request.get("state") != "active":
+        request_id = str(uuid4())
+        requests = dict(project.get("conversation_requests", {}))
+        available = max(0, project["budget_total"] - project.get("budget_spent", 0) - project.get("budget_reserved", 0))
+        requests[request_id] = {"id": request_id, "state": "active", "control_epoch": 0,
+            "context_epoch": 0, "budget_total": min(1.0, available), "budget_spent": 0,
+            "budget_reserved": 0, "model_calls": 0, "max_model_calls": 10,
+            "tool_calls": 0, "max_tool_calls": 6, "tool_history": [],
+            "latest_human_input_id": human["id"]}
+        tx.update("projects", pid, {"active_conversation_id": request_id, "conversation_requests": requests})
+    else:
+        update_request(tx, pid, "conversation:" + request_id, {
+            "latest_human_input_id": human["id"], "context_epoch": request.get("context_epoch", 0) + 1})
+    message = tx.create("messages", {"project_id": pid, "role": "user", "text": text,
+        "human_input_id": human["id"], "node_ids": node_ids, "attention_ids": attention_ids,
+        "work_scope": "conversation:" + request_id})
+    root = tx.get("holons", project["root_holon_id"])
+    tx.update("holons", root["id"], {"chat_stopped": False, "model_retry_count": 0,
+        "empty_turn_count": 0, "decision_retry_count": 0, "runtime_feedback": None})
+    tx.event(pid, "HUMAN_INPUT", {"message_id": message["id"], "human_input_id": human["id"],
+        "node_ids": node_ids, "attention_ids": attention_ids, "work_scope": "conversation:" + request_id})
+    tx.enqueue(pid, root["id"], "turn", {"reason": "human_input", "work_scope": "conversation:" + request_id})
+    return message
 
 
 def create_app(store: Store | None = None, *, data_dir: Path | None = None, workers=True, vault=None):
@@ -150,24 +197,8 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
         cached = getattr(app.state, "model_catalog", None)
         if cached and time.monotonic() - cached[0] < 300:
             return cached[1]
-        available = None
-        error = None
-        if vault.get("openai"):
-            from openai import AsyncOpenAI
-
-            try:
-                async with AsyncOpenAI(api_key=vault.get("openai"), timeout=15, max_retries=0) as provider:
-                    result = await provider.models.list()
-                    available = {m.id for m in result.data}
-            except Exception:
-                error = "Could not refresh account model availability. Presets remain available."
-        result = {
-            "models": [
-                m | {"available": m["id"] in available if available is not None else None} for m in MODELS
-            ],
-            "default_model": DEFAULT_MODEL,
-            "error": error,
-        }
+        from .model_catalog import account_catalog
+        result = await account_catalog(vault)
         app.state.model_catalog = (time.monotonic(), result)
         return result
 
@@ -175,7 +206,7 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
     def credentials():
         return [
             {"id": provider, "provider": provider, "configured": bool(vault.get(provider))}
-            for provider in ("openai", "openalex", "tavily")
+            for provider in ("openai", "openalex", "tavily", "baseten")
         ]
 
     @app.post("/credentials")
@@ -191,8 +222,9 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
         return {"id": body.provider, "provider": body.provider, "configured": True}
 
     @app.delete("/credentials/{provider}")
-    def delete_credential(provider: Literal["openai", "openalex", "tavily"]):
+    def delete_credential(provider: Literal["openai", "openalex", "tavily", "baseten"]):
         vault.delete(provider)
+        app.state.model_catalog = None
         return {"configured": bool(vault.get(provider)), "environment_fallback": bool(vault.get(provider))}
 
     @app.get("/projects")
@@ -214,7 +246,12 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                     "id": pid,
                     "title": body.title.strip(),
                     "goal": goal,
-                    "status": "paused",
+                    "status": "active",
+                    "research_state": "planning",
+                    "research_epoch": 0,
+                    "research_invitation": None,
+                    "conversation_requests": {},
+                    "active_conversation_id": None,
                     "settings": settings,
                     "budget_total": settings["budget_total"],
                     "budget_spent": 0.0,
@@ -324,22 +361,14 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
         return {"archived": True}
 
     def project_control(pid: str, action: str):
+        from .runtime import set_research_state
         with store.transaction() as tx:
             p = require(tx, "projects", pid)
-            p = tx.update(
-                "projects",
-                pid,
-                {
-                    "status": "paused" if action == "pause" else "active",
-                    "control_epoch": p.get("control_epoch", 0) + 1,
-                },
-            )
-            if action == "resume":
-                for h in tx.list("holons", pid):
-                    if h["status"] not in {"paused", "completed", "awaiting_permission"}:
-                        wake(tx, p, h["id"])
-            tx.event(pid, "PROJECT_" + action.upper() + "D", {})
-            return p
+            if p.get("status") == "archived":
+                raise HTTPException(409, "This project is archived")
+            if action == "resume" and not (p.get("research_invitation") or {}).get("accepted_human_input_id"):
+                raise HTTPException(409, "Agree to Sapling's invitation in Converse before starting pair research")
+            return set_research_state(tx, p, "paused" if action == "pause" else "running")
 
     @app.post("/projects/{pid}/pause")
     def pause_project(pid: str):
@@ -383,97 +412,48 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
             value = body.text.strip()
             if not value:
                 raise HTTPException(422, "Enter a message")
-            if not tx.list("human_inputs", pid):
-                p = tx.update("projects", pid, {"status": "active"})
-            human = tx.create("human_inputs", {"project_id": pid, "text": value})
-            message = tx.create(
-                "messages", {"project_id": pid, "role": "user", "text": value, "human_input_id": human["id"]}
-            )
-            # A reply in chat resolves scientific questions in the same channel.
-            # Permission approvals are explicit and never inferred from prose.
-            root = require(tx, "holons", p["root_holon_id"])
-            for item in tx.list("attention_items", pid, status="pending"):
-                if item.get("holon_id") != root["id"] or item.get("type") == "permission":
-                    continue
-                tx.update(
-                    "attention_items",
-                    item["id"],
-                    {"status": "resolved", "response": value, "human_input_id": human["id"]},
-                )
-                if item.get("decision_snapshot_id"):
-                    tx.update(
-                        "decision_snapshots",
-                        item["decision_snapshot_id"],
-                        {"human_override": {"human_input_id": human["id"], "text": value}},
-                    )
-                tx.event(pid, "ATTENTION_RESOLVED", {"attention_id": item["id"], "via": "conversation"})
-            tx.update(
-                "holons",
-                root["id"],
-                {
-                    "status": "active",
-                    "chat_stopped": False,
-                    "model_retry_count": 0,
-                    "empty_turn_count": 0,
-                    "decision_retry_count": 0,
-                    "runtime_feedback": None,
-                    "blocked_reason": None,
-                    "context_epoch": root.get("context_epoch", 0) + 1,
-                },
-            )
-            node = require(tx, "research_nodes", root["assigned_node_id"])
-            if node["status"] != "active":
-                tx.update("research_nodes", node["id"], {"status": "active"})
-            tx.event(pid, "HUMAN_INPUT", {"message_id": message["id"], "human_input_id": human["id"]})
-            wake(tx, p)
-            return message
+            return record_conversation(tx, p, value, body.node_ids, body.attention_ids)
 
     @app.post("/projects/{pid}/conversation/stop")
     async def stop_conversation(pid: str):
+        from .runtime import terminate_conversation_scope, update_request
         with store.transaction() as tx:
             p = require(tx, "projects", pid)
-            h = require(tx, "holons", p["root_holon_id"])
-            tx.update(
-                "holons", h["id"], {"chat_stopped": True, "control_epoch": h.get("control_epoch", 0) + 1}
-            )
-            tx.cancel_queued(h["id"])
-            tx.event(pid, "CONVERSATION_STOPPED", {"holon_id": h["id"]})
+            request_id = p.get("active_conversation_id")
+            request = p.get("conversation_requests", {}).get(request_id)
+            scope = "conversation:" + str(request_id)
+            if request and request.get("state") == "active":
+                update_request(tx, pid, scope, {"state": "cancelled", "control_epoch": request.get("control_epoch", 0) + 1})
+                for h in tx.list("holons", pid):
+                    tx.cancel_queued(h["id"], scope)
+                terminate_conversation_scope(tx, pid, scope)
+                tx.event(pid, "CONVERSATION_STOPPED", {"work_scope": scope})
         worker = getattr(app.state, "worker", None)
-        if worker:
-            await worker.stop_holon(h["id"])
-        return {"status": "stopped", "background_research": p["status"]}
+        if worker and request:
+            await worker.stop_scope(pid, scope)
+        return {"status": "stopped", "work_scope": scope, "background_research": p.get("research_state")}
 
     @app.post("/projects/{pid}/conversation/retry")
     def retry_conversation(pid: str):
+        from .runtime import update_request
         with store.transaction() as tx:
             p = require(tx, "projects", pid)
-            if not tx.list("messages", pid):
+            inputs = tx.list("human_inputs", pid)
+            if not inputs:
                 raise HTTPException(409, "Start with a message")
-            h = require(tx, "holons", p["root_holon_id"])
-            tx.update(
-                "holons",
-                h["id"],
-                {
-                    "status": "active",
-                    "chat_stopped": False,
-                    "model_retry_count": 0,
-                    "empty_turn_count": 0,
-                    "decision_retry_count": 0,
-                    "runtime_feedback": None,
-                    "blocked_reason": None,
-                    "context_epoch": h.get("context_epoch", 0) + 1,
-                },
-            )
-            tx.update("research_nodes", h["assigned_node_id"], {"status": "active"})
-            for item in tx.list("attention_items", pid, status="pending"):
-                if item.get("holon_id") == h["id"] and item.get("type") != "permission":
-                    tx.update(
-                        "attention_items",
-                        item["id"],
-                        {"status": "resolved", "resolution": "Retried from conversation"},
-                    )
-            wake(tx, p)
-            tx.event(pid, "CONVERSATION_RETRIED", {"holon_id": h["id"]})
+            request_id = p.get("active_conversation_id")
+            request = p.get("conversation_requests", {}).get(request_id)
+            if not request:
+                human = inputs[-1]
+                record_conversation(tx, p, human["text"], human.get("node_ids"), human.get("attention_ids"))
+            else:
+                scope = "conversation:" + request_id
+                update_request(tx, pid, scope, {"state": "active", "control_epoch": request.get("control_epoch", 0) + 1})
+                root = require(tx, "holons", p["root_holon_id"])
+                tx.update("holons", root["id"], {"model_retry_count": 0, "empty_turn_count": 0,
+                    "decision_retry_count": 0, "runtime_feedback": None})
+                tx.enqueue(pid, root["id"], "turn", {"reason": "conversation_retry", "work_scope": scope})
+            tx.event(pid, "CONVERSATION_RETRIED", {})
         return {"status": "queued"}
 
     def listing(kind):
@@ -517,6 +497,7 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
 
     @app.post("/holons/{id}/{action}")
     def holon_control(id: str, action: Literal["pause", "resume"]):
+        from .runtime import refresh_blockers
         with store.transaction() as tx:
             h = require(tx, "holons", id)
             p = require(tx, "projects", h["project_id"])
@@ -530,11 +511,13 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                         "holons",
                         item["id"],
                         {
-                            "status": "paused" if action == "pause" else "active",
+                            "status": "paused" if action == "pause" else item["status"],
+                            "manual_paused": action == "pause",
                             "control_epoch": item.get("control_epoch", 0) + 1,
                         },
                     )
                     if action == "resume":
+                        refresh_blockers(tx, p["id"], item["id"])
                         wake(tx, p, item["id"])
             tx.event(p["id"], "HOLON_" + action.upper() + "D", {"holon_id": id})
             return tx.get("holons", id)
@@ -546,7 +529,7 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
             p = require(tx, "projects", node["project_id"])
             guidance = f"Prioritize the research direction: {node['title']} (node {id})."
             human = tx.create(
-                "human_inputs", {"project_id": p["id"], "text": guidance, "preferred_node_id": id}
+                "human_inputs", {"project_id": p["id"], "text": guidance, "preferred_node_id": id, "node_ids": [id]}
             )
             tx.create(
                 "messages",
@@ -580,11 +563,8 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                         "eventual_outcome": None,
                     },
                 )
-            tx.update(
-                "projects",
-                p["id"],
-                {"control_epoch": p.get("control_epoch", 0) + 1, "evidence_epoch": p["evidence_epoch"] + 1},
-            )
+            owner = require(tx, "holons", node["owning_holon_id"])
+            tx.update("holons", owner["id"], {"control_epoch": owner.get("control_epoch", 0) + 1})
             tx.event(p["id"], "HUMAN_PRIORITY", {"node_id": id, "human_input_id": human["id"]})
             wake(tx, p)
             return {"status": "recorded", "human_input_id": human["id"], "node_id": id}
@@ -640,6 +620,17 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
             stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"}
         )
 
+    @app.post("/attention/{id}/read")
+    def read_attention(id: str):
+        from .store import now
+        with store.transaction() as tx:
+            item = require(tx, "attention_items", id)
+            if item.get("read_at"):
+                return item
+            item = tx.update("attention_items", id, {"read_at": now()})
+            tx.event(item["project_id"], "ATTENTION_READ", {"attention_id": id, "node_id": item.get("node_id")})
+            return item
+
     @app.post("/attention/{id}/respond")
     def respond(id: str, body: AttentionResponse):
         with store.transaction() as tx:
@@ -647,6 +638,10 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
             if item.get("status") != "pending":
                 raise HTTPException(409, "This attention item has already been resolved")
             p = require(tx, "projects", item["project_id"])
+            if item.get("type") != "permission":
+                if not body.response.strip():
+                    raise HTTPException(422, "Discuss this item in Converse to resolve it")
+                return record_conversation(tx, p, body.response.strip(), attention_ids=[id])
             result = tx.update(
                 "attention_items",
                 id,
@@ -661,12 +656,13 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                 if body.remember:
                     for category in item.get("categories", [item["category"]]):
                         tx.create("permission_grants", {"project_id": p["id"], "category": category})
-                tx.update("holons", h_id, {"status": "active"})
+                from .runtime import refresh_blockers
+                refresh_blockers(tx, p["id"], h_id)
                 tx.enqueue(
                     p["id"],
                     h_id,
                     "work_order",
-                    {"attention_id": id, "work_order": item["work_order"]},
+                    {"attention_id": id, "work_order": item["work_order"], "work_scope": item.get("work_scope", "research")},
                     priority=10,
                 )
             else:
@@ -687,15 +683,9 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                     snap = tx.get("decision_snapshots", item["decision_snapshot_id"])
                     if snap and snap["project_id"] == p["id"]:
                         tx.update("decision_snapshots", snap["id"], {"human_override": body.model_dump()})
-                target = tx.get("holons", h_id)
-                if target and target["status"] == "paused" and item.get("pauses_subtree"):
-                    tx.update(
-                        "holons",
-                        h_id,
-                        {"status": "active", "control_epoch": target.get("control_epoch", 0) + 1},
-                    )
-                wake(tx, p, h_id)
-            tx.update("projects", p["id"], {"control_epoch": p.get("control_epoch", 0) + 1})
+                from .runtime import refresh_blockers
+                refresh_blockers(tx, p["id"], h_id)
+                tx.enqueue(p["id"], h_id, "turn", {"reason": "permission_declined", "work_scope": item.get("work_scope", "research")})
             tx.event(p["id"], "ATTENTION_RESOLVED", {"attention_id": id, "approved": body.approve})
             return result
 

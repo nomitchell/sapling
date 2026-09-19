@@ -46,7 +46,9 @@ def test_project_bootstrap_chat_and_isolation(app_client):
     assert r.status_code == 201, r.text
     assert client.get(f"/projects/{other['id']}/messages").json() == []
     with store.transaction() as tx:
-        assert tx.get("holons", p["root_holon_id"])["context_epoch"] == 1
+        project_state = tx.get("projects", p["id"])
+        request = project_state["conversation_requests"][project_state["active_conversation_id"]]
+        assert request["context_epoch"] == 0
         assert tx.get("projects", p["id"])["control_epoch"] == 0
         assert len(tx.list("human_inputs", p["id"])) == 1
         assert len(tx.jobs(p["id"])) == 1
@@ -94,8 +96,12 @@ def test_artifact_upload_hash_and_append_only(app_client):
 def test_pause_resume_and_archive(app_client):
     client, store = app_client
     p = project(client)
-    assert client.post(f"/projects/{p['id']}/pause").json()["status"] == "paused"
-    assert client.post(f"/projects/{p['id']}/resume").json()["status"] == "active"
+    assert client.post(f"/projects/{p['id']}/pause").json()["research_state"] == "paused"
+    assert client.post(f"/projects/{p['id']}/resume").status_code == 409
+    with store.transaction() as tx:
+        human = tx.create("human_inputs", {"project_id": p["id"], "text": "Yes, start pair research"})
+        tx.update("projects", p["id"], {"research_invitation": {"id": "api-test", "accepted_human_input_id": human["id"]}})
+    assert client.post(f"/projects/{p['id']}/resume").json()["research_state"] == "running"
     assert client.delete(f"/projects/{p['id']}").json()["archived"]
     assert client.get("/projects").json() == []
     with store.transaction() as tx:
@@ -128,12 +134,24 @@ def test_permission_approval_cannot_be_replayed(app_client):
 def test_lease_expiry_does_not_replay_side_effect(app_client):
     client, store = app_client
     p = project(client)
-    client.post(f"/projects/{p['id']}/resume")
     with store.transaction() as tx:
-        tx.enqueue(p["id"], p["root_holon_id"], "turn", {})
+        request_id = "lease-test"
+        tx.update("projects", p["id"], {"active_conversation_id": request_id,
+            "budget_reserved": 0.04,
+            "conversation_requests": {request_id: {"id": request_id, "state": "active",
+                "budget_total": 0.2, "budget_reserved": 0.04, "budget_spent": 0}}})
+        root = tx.get("holons", p["root_holon_id"])
+        tx.update("holons", root["id"], {"budget_reserved": 0.04})
+        tx.enqueue(p["id"], p["root_holon_id"], "turn", {"work_scope": f"conversation:{request_id}"})
     first = store.claim("worker1", lease_seconds=-1)
     assert first
     assert store.claim("worker2") is None
     with store.transaction() as tx:
         assert tx.jobs(p["id"])[0]["state"] == "interrupted"
         assert tx.list("attention_items", p["id"])[0]["type"] == "interrupted_job"
+        current = tx.get("projects", p["id"])
+        request = current["conversation_requests"][request_id]
+        assert current["budget_reserved"] == 0 and current["budget_spent"] == 0.04
+        assert tx.get("holons", p["root_holon_id"])["budget_reserved"] == 0
+        assert request["budget_reserved"] == 0 and request["budget_spent"] == 0.04
+        assert any(e["type"] == "RESERVATION_RECONCILED" for e in tx.history(p["id"]))

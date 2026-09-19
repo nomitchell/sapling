@@ -12,10 +12,35 @@ import copy
 import json
 import math
 import re
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+CURRENT_SCOPE: ContextVar[str | None] = ContextVar("sapling_work_scope", default=None)
+
+
+def work_scope(holon: dict | None = None) -> str:
+    return CURRENT_SCOPE.get() or (holon or {}).get("work_scope") or "research"
+
+
+def conversation_request(project: dict, scope: str | None = None) -> dict | None:
+    scope = scope or CURRENT_SCOPE.get() or "research"
+    if not scope.startswith("conversation:"):
+        return None
+    return project.get("conversation_requests", {}).get(scope.split(":", 1)[1])
+
+
+def update_request(tx: Any, project_id: str, scope: str, patch: dict) -> dict:
+    project = tx.get("projects", project_id)
+    requests = copy.deepcopy(project.get("conversation_requests", {}))
+    request_id = scope.split(":", 1)[1]
+    requests[request_id] = {**requests[request_id], **patch}
+    tx.update("projects", project_id, {"conversation_requests": requests})
+    return requests[request_id]
 
 
 class Record(BaseModel):
@@ -138,11 +163,34 @@ class BudgetTransfer(Record):
     reason: str
 
 
+class ResearchControl(Record):
+    action: Literal["invite", "start", "pause", "resume"]
+    human_input_id: str | None = None
+    invitation_id: str | None = None
+
+
+class AttentionResolution(Record):
+    attention_id: str
+    human_input_id: str
+    resolution: str = Field(min_length=1)
+
+
+class NodeControl(Record):
+    node_id: str
+    action: Literal["guide", "delegate", "pause", "resume", "terminate"]
+    human_input_id: str
+    guidance: str = Field(min_length=1)
+    requested_budget: float | None = Field(default=None, gt=0)
+
+
 class HolonDecision(Record):
     response: str | None = None
     progress_note: str | None = None
     updated_summary: str
     research_goal: str | None = None
+    research_control: ResearchControl | None = None
+    attention_resolutions: list[AttentionResolution] = Field(default_factory=list, max_length=8)
+    node_controls: list[NodeControl] = Field(default_factory=list, max_length=8)
     node_updates: list[NodeUpdate] = Field(default_factory=list, max_length=20)
     budget_transfers: list[BudgetTransfer] = Field(default_factory=list, max_length=8)
     branch_proposals: list[BranchProposal] = Field(default_factory=list, max_length=12)
@@ -156,6 +204,15 @@ class HolonDecision(Record):
     peer_channel_requests: list[PeerChannelRequest] = Field(default_factory=list, max_length=4)
     attention_assessments: list[AttentionAssessment] = Field(default_factory=list, max_length=8)
     completion: HolonCompletion | None = None
+
+
+class ConversationSynthesis(Record):
+    """Response-only decision used after a bounded chat has gathered enough evidence."""
+
+    response: str = Field(min_length=1)
+    updated_summary: str
+    research_goal: str | None = None
+    research_control: ResearchControl | None = None
 
 
 class RoutingAssessment(Record):
@@ -204,7 +261,16 @@ information in a dataset from inductive biases and the computation to exploit it
 Use a small number of targeted searches; after receiving useful results, tell the
 user what you learned rather than searching indefinitely. Idle conversation needs
 no work orders, abandonment, completion, or attention. Return empty action lists.
+The conversation_request includes the complete bounded tool history. Do not repeat
+an earlier search or artifact read. A bounded request has a hard tool-action limit;
+when it is reached, synthesize the available evidence and state limitations rather
+than requesting more work. Continuous pair research has no such per-message limit.
 Only create/delegate substantive research branches when justified by the discussion.
+In continuous pair research, expose genuinely separable uncertainties as two to four
+non-overlapping frontier branches and delegate the highest-value independent work.
+Do not keep serially performing every independent search or experiment at the root.
+This is general research decomposition, not a fixed specialist pipeline; keep one
+root when the work is inherently sequential or too small to benefit from parallelism.
 For the root, response is user-facing prose; updated_summary is internal memory.
 Use Markdown naturally in response: paragraphs, useful headings, lists, tables for
 comparisons, source links, and fenced code with a language label. For mathematical
@@ -241,6 +307,40 @@ run_experiment {command:[executable,args...],files:{relative_path:contents},...}
 read_artifact {artifact_id, offset?, query?}; retrieve_evidence {evidence_id}.
 The query finds a literal phrase in extracted text at or after offset. Results
 report next_offset and total_characters; use those to reach later sections.
+Research lifecycle: planning and paused projects remain available for conversation.
+A project's current research_state and last_research_control are authoritative;
+they supersede older conversational requests to pause or resume.
+A conversational request permits bounded tools and recursive delegation only within
+its request budget; it does not authorize continuous research. Finish with a useful
+answer and stop. In running research, continue allocating valuable work until a
+defensible completion, blocker or budget limit. Do not finish merely by promising work.
+When the user asks to steer an already-running campaign or one of its research
+nodes, use node_controls to guide that campaign owner. Do not replace persistent
+campaign researchers with temporary conversational children. Conversational child
+holons are only for explicitly bounded background work during the current exchange.
+When a direction is ready, ask exactly "Should we start performing pair research?"
+and return research_control.action="invite". Do not start in the same turn.
+Only after the human agrees to the pending invitation in conversational context,
+return research_control.action="start" with invitation_id and human_input_id from
+context. A greeting, speculative discussion or unrelated "yes" is not agreement.
+Use research_control pause/resume only for explicit human guidance. Never clear an
+attention item merely because the human sent a message or read its details. Use
+attention_resolutions for the specific scientific item addressed by a human input;
+an explanation request alone does not resolve it. Execution permission is approved
+only through its exact-action approval control, never through these decisions.
+Human lifecycle, node, and attention controls are valid only in a conversational
+request grounded in the latest human input. Continuous research must leave all of
+those fields empty; it cannot infer human authorization from earlier conversation.
+Use node_controls with a referenced node and human_input_id for explicit guidance,
+delegation, pause, resume or termination. When the human explicitly asks to delegate
+an existing campaign node, use action="delegate"; this creates a persistent campaign
+researcher, while guide only sends direction to the node's current owner. Include a
+small requested_budget when the human gives a budget or asks for a bounded allocation.
+Referenced node context tells you its actual owner.
+Report control outcomes accurately and keep all human-facing discussion in Converse.
+Ground synthesis in scoped claims and their supports/contradictions. Shared model
+opinions are not independent evidence. Prefer experiments whose possible_outcomes
+would distinguish explanations; abandon weak directions when evidence warrants it.
 """
 
 
@@ -259,7 +359,8 @@ def branch_priority(
     ):
         raise ValueError("Priority inputs must be finite and counts/costs nonnegative")
     bonus = exploration * math.sqrt(math.log1p(local_allocations) / (1 + visits))
-    return (value + bonus) / math.sqrt(max(1.0, estimated_cost))
+    # A cent is the minimum accounting unit for priority, not a one-dollar floor.
+    return (value + bonus) / math.sqrt(max(0.01, estimated_cost))
 
 
 def widening_limit(allocations: int) -> int:
@@ -297,15 +398,41 @@ def _descendant(tx: Any, holon_id: str, ancestor_id: str, project_id: str) -> bo
     return False
 
 
-def _runnable(tx: Any, project: dict, holon: dict) -> bool:
-    if project.get("status") != "active":
+def _runnable(tx: Any, project: dict, holon: dict, scope: str | None = None) -> bool:
+    if not project or not holon or project.get("status") != "active":
         return False
-    if holon.get("chat_stopped"):
+    scope = scope or work_scope(holon)
+    request = conversation_request(project, scope)
+    conversational = scope.startswith("conversation:")
+    if conversational:
+        if not request or request.get("state") != "active":
+            return False
+        if holon.get("parent_id") and holon.get("work_scope", "research") != scope:
+            return False
+    elif project.get("research_state", "running") != "running":
         return False
+    if holon.get("terminated"):
+        return False
+    if not conversational and holon.get("chat_stopped") and "research_state" not in project:
+        return False  # compatibility for pre-migration fixtures
+    blocking = [
+        item
+        for item in tx.list("attention_items", project_id=project["id"], status="pending")
+        if item.get("work_scope") in {None, scope}
+    ]
     seen: set[str] = set()
     current = holon
     while current:
-        if current["id"] in seen or current.get("status") != "active":
+        root_conversation = conversational and current["id"] == project.get("root_holon_id")
+        if current["id"] in seen or current.get("terminated"):
+            return False
+        if not root_conversation and (current.get("status") != "active" or current.get("manual_paused")):
+            return False
+        if not root_conversation and any(
+            a.get("holon_id") == current["id"]
+            and (a.get("pauses_subtree") or a.get("type") == "permission")
+            for a in blocking
+        ):
             return False
         seen.add(current["id"])
         parent_id = current.get("parent_id")
@@ -474,7 +601,7 @@ class HolonContextBuilder:
         ]
         parent = _owned(tx, "holons", holon["parent_id"], pid) if holon.get("parent_id") else None
         sources = {}
-        if hid == project.get("root_holon_id"):
+        if True:
             artifacts = tx.list("artifacts", project_id=pid)
             extracted = {a.get("metadata", {}).get("source_artifact_id"): a["id"]
                          for a in artifacts if a.get("type") == "extracted_text"}
@@ -484,16 +611,40 @@ class HolonContextBuilder:
                 if artifact.get("type") == "source" and url:
                     sources[url] = {"title": meta.get("title", ""), "url": url,
                                     "artifact_id": extracted.get(artifact["id"], artifact["id"])}
+        visible_claims = _bounded(claims[-30:][::-1], 9000)
+        visible_ids = {c["id"] for c in visible_claims}
+        relations = [r for r in tx.list("claim_evidence", project_id=pid) if r["claim_id"] in visible_ids]
+        linked_ids = {r["evidence_id"] for r in relations}
+        request = conversation_request(project)
+        human = tx.get("human_inputs", request.get("latest_human_input_id")) if request else None
+        selected = [_owned(tx, "research_nodes", nid, pid) for nid in (human or {}).get("node_ids", [])]
+        attention = [a for a in tx.list("attention_items", project_id=pid, status="pending")
+                     if hid == project.get("root_holon_id") or a.get("holon_id") == hid]
         return {
             "instructions": INSTRUCTIONS,
             "sources": _bounded(list(sources.values())[-16:], 6000),
-            "runtime_feedback": holon.get("runtime_feedback"),
+            "work_scope": work_scope(holon),
+            "conversation_request": _public(request),
+            "selected_nodes": _bounded(selected, 7000),
+            "attention": _bounded(attention, 8000),
+            "claim_evidence": _bounded(relations, 6000),
+            "linked_evidence": _bounded([e for e in evidence if e["id"] in linked_ids], 9000),
+            "runtime_feedback": (
+                "The bounded conversation has used all of its tool actions. Return a substantive "
+                "answer now from the available results, with source links and limitations. Do not "
+                "request more tools or delegation."
+                if request and request.get("tool_calls", 0) >= request.get("max_tool_calls", 6)
+                else holon.get("runtime_feedback")
+            ),
             "output_repair": "The previous decision was invalid. Follow the supplied schema exactly; arguments and scope use structured key/value entries, not JSON strings."
             if holon.get("model_retry_count")
             else None,
             "project": {
                 "id": pid,
                 "goal": project.get("goal"),
+                "research_state": project.get("research_state", "running"),
+                "research_invitation": project.get("research_invitation"),
+                "last_research_control": project.get("last_research_control"),
                 "evidence_epoch": project.get("evidence_epoch", 0),
                 "settings": _public(project.get("settings", {})),
             },
@@ -517,7 +668,7 @@ class HolonContextBuilder:
             "parent_directive": parent.get("goal") if parent else None,
             "frontier": _bounded(frontier, 14000),
             "children": _bounded(visible_children, 7000),
-            "claims": _bounded(claims[-30:][::-1], 9000),
+            "claims": visible_claims,
             "local_evidence": _bounded(local, 7000),
             "messages": _bounded(visible_messages, 7000),
             "retrieved_evidence": _bounded(historical, 7000),
@@ -553,16 +704,22 @@ class HolonContextBuilder:
 
 
 def _fence(project: dict, holon: dict) -> tuple:
+    scope = work_scope(holon)
+    request = conversation_request(project, scope)
     return (
-        project.get("evidence_epoch", 0),
         project.get("control_epoch", 0),
+        scope,
+        request.get("control_epoch", 0) if request else project.get("research_epoch", 0),
         holon.get("control_epoch", 0),
         holon.get("turn_count", 0),
-        holon.get("context_epoch", 0),
+        request.get("context_epoch", 0) if request else holon.get("context_epoch", 0),
     )
 
 
 def _reserve(tx: Any, project: dict, holon: dict, amount: float) -> None:
+    request = conversation_request(project)
+    if request and amount > request["budget_total"] - request.get("budget_spent", 0) - request.get("budget_reserved", 0) + 1e-9:
+        raise RuntimeRejected("The bounded conversation request has no available budget")
     amount = _number(amount)
     if (
         amount > _number(holon.get("budget_remaining")) - _number(holon.get("budget_reserved")) + 1e-9
@@ -577,6 +734,8 @@ def _reserve(tx: Any, project: dict, holon: dict, amount: float) -> None:
         "projects", project["id"], {"budget_reserved": _number(project.get("budget_reserved")) + amount}
     )
     tx.update("holons", holon["id"], {"budget_reserved": _number(holon.get("budget_reserved")) + amount})
+    if request:
+        update_request(tx, project["id"], work_scope(holon), {"budget_reserved": request.get("budget_reserved", 0) + amount})
 
 
 def _settle(
@@ -592,6 +751,12 @@ def _settle(
 ) -> None:
     project, holon = tx.get("projects", pid), _owned(tx, "holons", hid, pid)
     actual = _number(actual)
+    request = conversation_request(project)
+    if request:
+        update_request(tx, pid, work_scope(holon), {
+            "budget_reserved": max(0, request.get("budget_reserved", 0) - reserved),
+            "budget_spent": request.get("budget_spent", 0) + actual,
+        })
     tx.update(
         "projects",
         pid,
@@ -611,6 +776,8 @@ def _settle(
     )
     if actual:
         _record_spend(tx, pid, node_id or holon["assigned_node_id"], actual)
+    if holon.get("terminated"):
+        return_terminated_budgets(tx, pid)
     tx.event(
         pid,
         "USAGE_RECORDED",
@@ -672,6 +839,9 @@ def _attention(
         {
             "project_id": project["id"],
             "holon_id": holon["id"],
+            "node_id": holon.get("assigned_node_id"),
+            "read_at": None,
+            "work_scope": work_scope(holon),
             **assessment.model_dump(),
             "status": "pending",
             "type": "research_decision",
@@ -689,6 +859,275 @@ def _attention(
             "holons", holon["id"], {"status": "paused", "control_epoch": holon.get("control_epoch", 0) + 1}
         )
     return pause
+
+
+def set_research_state(tx: Any, project: dict, state: str, *, human_input_id: str | None = None) -> dict:
+    if state not in {"planning", "running", "paused"}:
+        raise RuntimeRejected("Unknown research state")
+    latest = tx.get("projects", project["id"])
+    if state == "running" and "research_state" in latest and not (latest.get("research_invitation") or {}).get("accepted_human_input_id"):
+        raise RuntimeRejected("Agree to the pair research invitation before starting continuous work")
+    if latest.get("research_state") == state:
+        return latest
+    updated = tx.update("projects", project["id"], {
+        "status": "active", "research_state": state,
+        "research_epoch": latest.get("research_epoch", 0) + 1,
+        "last_research_control": {
+            "state": state,
+            "human_input_id": human_input_id,
+            "created_at": _now().isoformat(),
+        },
+    })
+    tx.event(project["id"], "RESEARCH_STATE_CHANGED", {"state": state, "human_input_id": human_input_id})
+    if state == "running":
+        for holon in tx.list("holons", project_id=project["id"]):
+            if holon.get("work_scope", "research") == "research" and _runnable(tx, updated, holon, "research"):
+                tx.enqueue(project["id"], holon["id"], "turn", {"reason": "research_started", "work_scope": "research"})
+    return updated
+
+
+def refresh_blockers(tx: Any, project_id: str, holon_id: str) -> dict:
+    holon = _owned(tx, "holons", holon_id, project_id)
+    blockers = [a for a in tx.list("attention_items", project_id=project_id, status="pending")
+                if a.get("holon_id") == holon_id and (a.get("pauses_subtree") or a.get("type") == "permission")]
+    if not blockers and not holon.get("manual_paused") and not holon.get("terminated"):
+        if holon.get("status") in {"paused", "blocked", "error", "awaiting_permission"}:
+            holon = tx.update("holons", holon_id, {"status": "active", "blocked_reason": None})
+    return holon
+
+
+def resolve_attention(tx: Any, project: dict, item: dict, resolution: str, human_input_id: str) -> dict:
+    if item.get("type") == "permission":
+        raise RuntimeRejected("Execution permissions require their exact-action approval control")
+    if item.get("status") != "pending":
+        return item
+    human = _owned(tx, "human_inputs", human_input_id, project["id"])
+    node = item.get("node_id")
+    owner = tx.get("holons", item.get("holon_id"))
+    node = node or (owner or {}).get("assigned_node_id")
+    if item["id"] not in human.get("attention_ids", []) and node not in human.get("node_ids", []):
+        raise RuntimeRejected("Attention resolution must reference the human's selected item or node")
+    result = tx.update("attention_items", item["id"], {
+        "status": "resolved", "resolution": resolution, "response": human["text"],
+        "human_input_id": human_input_id, "resolved_at": _now().isoformat(),
+    })
+    if owner:
+        owner = refresh_blockers(tx, project["id"], owner["id"])
+        tx.update("holons", owner["id"], {"control_epoch": owner.get("control_epoch", 0) + 1})
+        tx.create("holon_messages", {"project_id": project["id"], "sender_holon_id": project["root_holon_id"],
+            "recipient_holon_id": owner["id"], "summary": resolution, "node_refs": [node] if node else [],
+            "claim_refs": [], "evidence_refs": [], "human_input_id": human_input_id})
+        tx.enqueue(project["id"], owner["id"], "turn", {"reason": "attention_resolved", "work_scope": item.get("work_scope", owner.get("work_scope", "research"))})
+    if item.get("decision_snapshot_id"):
+        tx.update("decision_snapshots", item["decision_snapshot_id"], {"human_override": {
+            "human_input_id": human_input_id, "attention_id": item["id"], "resolution": resolution}})
+    tx.event(project["id"], "ATTENTION_RESOLVED", {"attention_id": item["id"], "node_id": node, "via": "conversation"})
+    return result
+
+
+def control_node(
+    tx: Any,
+    project: dict,
+    node: dict,
+    action: str,
+    guidance: str,
+    human_input_id: str,
+    requested_budget: float | None = None,
+) -> None:
+    human = _owned(tx, "human_inputs", human_input_id, project["id"])
+    if node["id"] not in human.get("node_ids", []):
+        raise RuntimeRejected("Node control requires a node reference in the human input")
+    owner = _owned(tx, "holons", node["owning_holon_id"], project["id"])
+    if action == "delegate":
+        if not (project.get("research_invitation") or {}).get("accepted_human_input_id"):
+            raise RuntimeRejected("Persistent delegation requires an accepted pair research invitation")
+        if node.get("status", "active") != "active":
+            raise RuntimeRejected("Cannot delegate an inactive research node")
+        root_node = (tx.get("holons", project["root_holon_id"]) or {}).get("assigned_node_id")
+        if node["id"] == root_node:
+            raise RuntimeRejected("Delegate a child direction, retaining the root coordinator")
+        existing_id = node.get("delegated_holon_id")
+        if existing_id:
+            existing = _owned(tx, "holons", existing_id, project["id"])
+            tx.create("holon_messages", {
+                "project_id": project["id"], "sender_holon_id": project["root_holon_id"],
+                "recipient_holon_id": existing["id"], "summary": guidance, "node_refs": [node["id"]],
+                "claim_refs": [], "evidence_refs": [], "human_input_id": human_input_id,
+            })
+            tx.update("holons", existing["id"], {"control_epoch": existing.get("control_epoch", 0) + 1})
+            tx.enqueue(project["id"], existing["id"], "turn", {"reason": "human_guidance", "work_scope": "research"})
+        else:
+            settings = project.get("settings", {})
+            if settings.get("max_depth") is not None and owner.get("depth", 0) >= int(settings["max_depth"]):
+                raise RuntimeRejected("Maximum holarchy depth reached")
+            active = [h for h in tx.list("holons", project_id=project["id"])
+                      if h.get("status") in {"active", "awaiting_permission", "paused"}]
+            if len(active) >= int(settings.get("max_holons", 32)):
+                raise RuntimeRejected("Maximum project holon count reached")
+            available = _number(owner.get("budget_remaining")) - _number(owner.get("budget_reserved"))
+            amount = requested_budget
+            if amount is None:
+                amount = min(0.1, max(0.01, available * 0.2))
+            if amount > available + 1e-9:
+                raise RuntimeRejected("Persistent delegation exceeds the owner's available budget")
+            child = tx.create("holons", {
+                "project_id": project["id"], "parent_id": owner["id"], "work_scope": "research",
+                "goal": guidance, "summary": "", "initial_objectives": [],
+                "assigned_node_id": node["id"], "budget_total": 0, "budget_remaining": 0,
+                "budget_reserved": 0, "depth": owner.get("depth", 0) + 1, "status": "active",
+                "coordinator_session_id": None, "independence_group": f"human:{human_input_id}",
+                "independent_result_ready": False, "control_epoch": 0, "turn_count": 0,
+            })
+            _transfer(tx, project, owner, child, amount, "human-directed persistent delegation")
+            tx.update("research_nodes", node["id"], {
+                "owning_holon_id": child["id"], "delegated_holon_id": child["id"], "value_estimate": None,
+            })
+            _record_allocation(tx, project["id"], owner["id"], node["id"])
+            tx.event(project["id"], "HOLON_CREATED", {
+                "holon_id": child["id"], "parent_id": owner["id"], "node_id": node["id"],
+                "source": "human_control",
+            })
+            tx.enqueue(project["id"], child["id"], "turn", {
+                "reason": "human_delegated", "work_scope": "research",
+            })
+    elif action == "guide":
+        tx.create("holon_messages", {"project_id": project["id"], "sender_holon_id": project["root_holon_id"],
+            "recipient_holon_id": owner["id"], "summary": guidance, "node_refs": [node["id"]],
+            "claim_refs": [], "evidence_refs": [], "human_input_id": human_input_id})
+        tx.update("holons", owner["id"], {"control_epoch": owner.get("control_epoch", 0) + 1})
+        tx.update("research_nodes", node["id"], {"value_estimate": None})
+        tx.enqueue(project["id"], owner["id"], "turn", {"reason": "human_guidance", "work_scope": owner.get("work_scope", "research")})
+    elif node["id"] == (tx.get("holons", project["root_holon_id"]) or {}).get("assigned_node_id") and action != "terminate":
+        set_research_state(tx, project, "paused" if action == "pause" else "running", human_input_id=human_input_id)
+    else:
+        if node["id"] == (tx.get("holons", project["root_holon_id"]) or {}).get("assigned_node_id"):
+            set_research_state(tx, project, "paused", human_input_id=human_input_id)
+        descendants = {node["id"]}
+        nodes = tx.list("research_nodes", project_id=project["id"])
+        for _ in nodes:
+            descendants.update(n["id"] for n in nodes if n.get("parent_id") in descendants)
+        for item in nodes:
+            if item["id"] in descendants:
+                tx.update("research_nodes", item["id"], {"status": {"pause": "paused", "resume": "active", "terminate": "abandoned"}[action]})
+        for holon in tx.list("holons", project_id=project["id"]):
+            if holon.get("assigned_node_id") not in descendants or holon["id"] == project["root_holon_id"]:
+                continue
+            if holon.get("terminated") or holon.get("status") == "completed":
+                continue
+            patch = {"control_epoch": holon.get("control_epoch", 0) + 1, "manual_paused": action == "pause"}
+            if action == "terminate":
+                patch.update(terminated=True, status="completed")
+                tx.cancel_queued(holon["id"])
+            elif action == "pause":
+                patch["status"] = "paused"
+            tx.update("holons", holon["id"], patch)
+            if action == "resume":
+                refresh_blockers(tx, project["id"], holon["id"])
+                tx.enqueue(project["id"], holon["id"], "turn", {"reason": "branch_resumed", "work_scope": holon.get("work_scope", "research")})
+        if action == "terminate":
+            return_terminated_budgets(tx, project["id"])
+    tx.event(project["id"], "NODE_CONTROLLED", {"node_id": node["id"], "action": action, "guidance": guidance, "human_input_id": human_input_id})
+
+
+def _human_controls(tx: Any, project: dict, holon: dict, decision: HolonDecision) -> None:
+    if not (decision.research_control or decision.node_controls or decision.attention_resolutions):
+        return
+    if holon["id"] != project.get("root_holon_id") or not conversation_request(project):
+        raise RuntimeRejected("Human controls belong to the root's conversational request")
+    request = conversation_request(project)
+    latest_human = request.get("latest_human_input_id")
+    for control in [*decision.node_controls, *decision.attention_resolutions]:
+        if control.human_input_id != latest_human:
+            raise RuntimeRejected("Control must be grounded in the latest human input")
+    control = decision.research_control
+    if control:
+        invitation = project.get("research_invitation")
+        if control.action == "invite":
+            if project.get("research_state") == "running":
+                raise RuntimeRejected("Research is already running")
+            if not (decision.research_goal or project.get("goal")):
+                raise RuntimeRejected("Discuss a research direction before inviting continuous research")
+            if not invitation or invitation.get("status") != "pending":
+                invitation = {"id": str(uuid4()), "status": "pending", "created_at": _now().isoformat(),
+                    "human_input_id": latest_human}
+                tx.update("projects", project["id"], {"research_invitation": invitation})
+                tx.event(project["id"], "RESEARCH_INVITED", invitation)
+        else:
+            if control.human_input_id != latest_human:
+                raise RuntimeRejected("Research control must cite the latest human input")
+            human = _owned(tx, "human_inputs", control.human_input_id, project["id"])
+            if control.action == "start":
+                if not invitation or invitation.get("status") != "pending" or control.invitation_id != invitation["id"]:
+                    raise RuntimeRejected("Starting research requires the pending invitation")
+                if human["created_at"] <= invitation["created_at"]:
+                    raise RuntimeRejected("Agreement must follow the invitation")
+                tx.update("projects", project["id"], {"research_invitation": {
+                    **invitation, "status": "accepted", "accepted_human_input_id": human["id"]}})
+            elif control.action == "resume" and not (project.get("research_invitation") or {}).get("accepted_human_input_id"):
+                raise RuntimeRejected("Begin pair research through its invitation before resuming")
+            set_research_state(tx, project, "paused" if control.action == "pause" else "running", human_input_id=human["id"])
+    for resolution in decision.attention_resolutions:
+        item = _owned(tx, "attention_items", resolution.attention_id, project["id"])
+        resolve_attention(tx, project, item, resolution.resolution, resolution.human_input_id)
+    for control in decision.node_controls:
+        node = _owned(tx, "research_nodes", control.node_id, project["id"])
+        control_node(
+            tx,
+            project,
+            node,
+            control.action,
+            control.guidance,
+            control.human_input_id,
+            control.requested_budget,
+        )
+
+
+def return_terminated_budgets(tx: Any, project_id: str) -> None:
+    holons = sorted(tx.list("holons", project_id=project_id), key=lambda h: h.get("depth", 0), reverse=True)
+    for row in holons:
+        holon = tx.get("holons", row["id"])
+        if not holon.get("terminated") or not holon.get("parent_id") or holon.get("budget_reserved", 0) > 0:
+            continue
+        amount = holon.get("budget_remaining", 0)
+        if amount > 0:
+            parent = tx.get("holons", holon["parent_id"])
+            tx.update("holons", holon["id"], {"budget_remaining": 0})
+            tx.update("holons", parent["id"], {"budget_remaining": parent.get("budget_remaining", 0) + amount})
+            tx.event(project_id, "BUDGET_REALLOCATED", {"from_holon_id": holon["id"], "to_holon_id": parent["id"],
+                "amount_usd": amount, "reason": "terminated branch budget returned"})
+
+
+def terminate_conversation_scope(tx: Any, project_id: str, scope: str) -> None:
+    """End temporary descendants and return still-active nodes to their campaign owner."""
+    scoped = [
+        h
+        for h in tx.list("holons", project_id=project_id)
+        if h.get("parent_id") and h.get("work_scope") == scope
+    ]
+    for holon in scoped:
+        tx.cancel_queued(holon["id"], scope)
+        if holon.get("status") != "completed" or not holon.get("terminated"):
+            tx.update("holons", holon["id"], {"terminated": True, "status": "completed"})
+    return_terminated_budgets(tx, project_id)
+    for holon in scoped:
+        node = tx.get("research_nodes", holon.get("assigned_node_id"))
+        parent = tx.get("holons", holon.get("parent_id"))
+        if (
+            node
+            and parent
+            and node.get("status", "active") == "active"
+            and node.get("delegated_holon_id") == holon["id"]
+        ):
+            tx.update(
+                "research_nodes",
+                node["id"],
+                {"owning_holon_id": parent["id"], "delegated_holon_id": None},
+            )
+            tx.event(
+                project_id,
+                "CONVERSATION_NODE_RELEASED",
+                {"node_id": node["id"], "holon_id": holon["id"], "scope": scope},
+            )
 
 
 def _frontier(tx: Any, holon: dict) -> list[dict]:
@@ -945,6 +1384,28 @@ def _transfer(tx: Any, project: dict, parent: dict, child: dict, amount: float, 
 def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision, context: dict) -> dict:
     """Apply a validated decision inside one transaction; reject it atomically."""
     pid, hid = project["id"], holon["id"]
+    if not conversation_request(project) and (
+        decision.research_control or decision.node_controls or decision.attention_resolutions
+    ):
+        tx.event(
+            pid,
+            "HUMAN_CONTROLS_IGNORED",
+            {
+                "holon_id": hid,
+                "research_control": bool(decision.research_control),
+                "node_controls": len(decision.node_controls),
+                "attention_resolutions": len(decision.attention_resolutions),
+            },
+        )
+        decision = decision.model_copy(
+            update={
+                "research_control": None,
+                "node_controls": [],
+                "attention_resolutions": [],
+            }
+        )
+    _human_controls(tx, project, holon, decision)
+    project = tx.get("projects", pid)
     aliases: dict[str, str] = {}
     published: list[str] = []
     if decision.completion and (decision.work_orders or decision.child_holon_requests):
@@ -1126,6 +1587,9 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
             "human_override": None,
             "eventual_outcome": None,
             "decision": decision.model_dump(),
+            "work_scope": work_scope(holon),
+            "model": project.get("settings", {}).get("model"),
+            "provider": project.get("settings", {}).get("provider", "openai"),
         },
     )
 
@@ -1199,6 +1663,7 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 "channel": "progress",
                 "content": decision.progress_note,
                 "text": decision.progress_note,
+                "work_scope": work_scope(holon),
             },
         )
         tx.event(pid, "ASSISTANT_MESSAGE", {"message_id": note["id"], "holon_id": hid})
@@ -1209,9 +1674,14 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 "project_id": pid,
                 "holon_id": hid,
                 "role": "assistant",
-                "channel": "answer",
+                "channel": (
+                    "progress"
+                    if work_scope(holon) == "research" and project.get("research_state") == "running"
+                    else "answer"
+                ),
                 "content": decision.response,
                 "text": decision.response,
+                "work_scope": work_scope(holon),
             },
         )
         tx.event(pid, "ASSISTANT_MESSAGE", {"message_id": message["id"], "holon_id": hid})
@@ -1241,7 +1711,7 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 raise RuntimeRejected("Cannot delegate an inactive research node")
             if node["id"] == holon.get("assigned_node_id"):
                 raise RuntimeRejected("Delegate a child direction, retaining the coordinator's assigned node")
-            if holon.get("depth", 0) >= int(settings.get("max_depth", 5)):
+            if settings.get("max_depth") is not None and holon.get("depth", 0) >= int(settings["max_depth"]):
                 raise RuntimeRejected("Maximum holarchy depth reached")
             active_holons = [
                 h
@@ -1258,6 +1728,7 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 {
                     "project_id": pid,
                     "parent_id": hid,
+                    "work_scope": work_scope(holon),
                     "goal": request.objective,
                     "summary": "",
                     "initial_objectives": request.child_objectives,
@@ -1319,7 +1790,10 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 },
             )
         if decision.completion:
-            _complete(tx, project, holon, decision.completion)
+            if hid == project.get("root_holon_id") and conversation_request(project):
+                pass  # The root remains available; its request closes after children finish.
+            else:
+                _complete(tx, project, holon, decision.completion)
     else:
         tx.update("holons", hid, {"pending_decision_snapshot_id": snapshot["id"]})
     tx.event(
@@ -1348,13 +1822,17 @@ def _block(tx: Any, project: dict, holon: dict, reason: str, message: str) -> No
         {
             "project_id": project["id"],
             "holon_id": holon["id"],
+            "node_id": holon.get("assigned_node_id"),
             "status": "pending",
+            "read_at": None,
             "type": reason,
+            "pauses_subtree": True,
             "summary": message,
             "importance": 0.8,
             "decision_value": 0.8,
             "possible_responses": ["Review and resume"],
             "default_action": None,
+            "work_scope": work_scope(holon),
         },
     )
     tx.event(project["id"], "ATTENTION_CREATED", {"attention_id": item["id"], "holon_id": holon["id"]})
@@ -1384,6 +1862,17 @@ async def _call_model(
             - _number(project.get("budget_spent"))
             - _number(project.get("budget_reserved")),
         )
+        request = conversation_request(project)
+        if request:
+            available = min(available, request["budget_total"] - request.get("budget_spent", 0) - request.get("budget_reserved", 0))
+            if request.get("model_calls", 0) >= request.get("max_model_calls", 24) or available <= 0:
+                update_request(tx, pid, work_scope(holon), {"state": "completed", "limit_reached": True})
+                tx.create("messages", {"project_id": pid, "holon_id": project["root_holon_id"],
+                    "role": "assistant", "channel": "answer", "work_scope": work_scope(holon),
+                    "text": "This conversational investigation reached its bounded allowance. Its findings and sources are saved; we can discuss them or continue with a new request."})
+                terminate_conversation_scope(tx, pid, work_scope(holon))
+                return None
+            update_request(tx, pid, work_scope(holon), {"model_calls": request.get("model_calls", 0) + 1})
         reserved = min(_number(settings.get("max_turn_cost_usd", 1)), available)
         if (
             settings.get("input_cost_per_million") is not None
@@ -1424,7 +1913,10 @@ async def _call_model(
                     "diagnostics": _public(getattr(exc, "diagnostics", [])),
                 },
             )
-            if isinstance(exc, asyncio.CancelledError) and holon.get("chat_stopped"):
+            request = conversation_request(project, work_scope(holon))
+            if isinstance(exc, asyncio.CancelledError) and (
+                holon.get("chat_stopped") or (request and request.get("state") != "active")
+            ):
                 tx.event(pid, "MODEL_CANCELLED", {"holon_id": hid, "usage_unknown": known is None})
             elif (
                 not isinstance(exc, asyncio.CancelledError)
@@ -1489,7 +1981,23 @@ async def _call_model(
     return decision, usage, cost, response_id
 
 
-async def run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any) -> dict:
+async def run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *, scope: str | None = None, cache_dir=None) -> dict:
+    with store.transaction() as tx:
+        holon = tx.get("holons", holon_id)
+        project = tx.get("projects", holon["project_id"]) if holon else {}
+    scope = scope or CURRENT_SCOPE.get()
+    if not scope:
+        request_id = project.get("active_conversation_id")
+        request = project.get("conversation_requests", {}).get(request_id)
+        scope = "conversation:" + request_id if holon and not holon.get("parent_id") and request and request.get("state") == "active" else (holon or {}).get("work_scope", "research")
+    token = CURRENT_SCOPE.set(scope)
+    try:
+        return await _run_turn(store, holon_id, model, tool_dispatch, cache_dir=cache_dir)
+    finally:
+        CURRENT_SCOPE.reset(token)
+
+
+async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *, cache_dir=None) -> dict:
     """Run one bounded coordinator turn. The caller leases one job per holon."""
     with store.transaction() as tx:
         holon = tx.get("holons", holon_id)
@@ -1501,12 +2009,20 @@ async def run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any) ->
         context = HolonContextBuilder().build(tx, holon, project)
         expected = _fence(project, holon)
         pid = project["id"]
-    result = await _call_model(store, pid, holon_id, model, context, HolonDecision, expected_fence=expected)
+    request = conversation_request(project, work_scope(holon))
+    synthesis_only = bool(
+        request and request.get("tool_calls", 0) >= request.get("max_tool_calls", 6)
+    )
+    schema = ConversationSynthesis if synthesis_only else HolonDecision
+    result = await _call_model(store, pid, holon_id, model, context, schema, expected_fence=expected)
     if result is None:
         return {"status": "blocked_or_stale"}
     raw, usage, cost, _ = result
     try:
-        decision = raw if isinstance(raw, HolonDecision) else HolonDecision.model_validate(raw)
+        if isinstance(raw, ConversationSynthesis):
+            decision = HolonDecision.model_validate(raw.model_dump())
+        else:
+            decision = raw if isinstance(raw, HolonDecision) else HolonDecision.model_validate(raw)
         with store.transaction() as tx:
             project, holon = tx.get("projects", pid), _owned(tx, "holons", holon_id, pid)
             if not _runnable(tx, project, holon) or _fence(project, holon) != expected:
@@ -1527,6 +2043,21 @@ async def run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any) ->
                     "using node_assessments before requesting the next work_order. Inspect frontier stale flags."})
                 tx.enqueue(pid, holon_id, "turn", {"reason": "reassess_stale_values"})
                 return {"status": "retrying", "cost_usd": cost, "usage": usage}
+            if not holon.get("decision_retry_count") and _runnable(tx, project, holon):
+                tx.update(
+                    "holons",
+                    holon_id,
+                    {
+                        "decision_retry_count": 1,
+                        "runtime_feedback": (
+                            "Your last decision was not executed because it violated this runtime "
+                            f"constraint: {str(exc)[:600]}. Use only IDs present in the current "
+                            "context, preserve ownership and scope, and return one corrected decision."
+                        ),
+                    },
+                )
+                tx.enqueue(pid, holon_id, "turn", {"reason": "repair_runtime_constraint"})
+                return {"status": "retrying", "cost_usd": cost, "usage": usage}
             _block(
                 tx,
                 project,
@@ -1542,15 +2073,58 @@ async def run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any) ->
         applied["published_evidence_ids"].extend(tool_result.get("published_evidence_ids", []))
         cost += _number(tool_result.get("cost_usd"))
     for evidence_id in applied["published_evidence_ids"]:
-        routing = await route_evidence(store, evidence_id, model)
+        routing = await route_evidence(store, evidence_id, model, cache_dir=cache_dir)
         cost += _number(routing.get("cost_usd"))
     with store.transaction() as tx:
         project, holon = tx.get("projects", pid), _owned(tx, "holons", holon_id, pid)
-        if _runnable(tx, project, holon) and (applied["work_order"] or applied["published_evidence_ids"]):
+        runnable = _runnable(tx, project, holon)
+        request = conversation_request(project)
+        if runnable and (applied["work_order"] or applied["published_evidence_ids"]):
             tx.update("holons", holon_id, {"empty_turn_count": 0, "runtime_feedback": None})
             tx.enqueue(pid, holon_id, "turn", {"reason": "work_completed"})
-        elif (_runnable(tx, project, holon) and holon_id == project.get("root_holon_id")
-              and not decision.response and not applied["child_holon_ids"]):
+        elif request and runnable and holon_id == project.get("root_holon_id"):
+            children = [
+                h
+                for h in tx.list("holons", project_id=pid)
+                if h.get("work_scope") == work_scope(holon) and h.get("status") != "completed"
+            ]
+            if (decision.response or decision.completion) and not children:
+                tx.update("holons", holon_id, {"empty_turn_count": 0, "runtime_feedback": None})
+                update_request(tx, pid, work_scope(holon), {"state": "completed"})
+            elif not decision.response and not applied["child_holon_ids"]:
+                count = int(holon.get("empty_turn_count", 0)) + 1
+                tx.update("holons", holon_id, {"empty_turn_count": count, "runtime_feedback":
+                    "Your last decision contained no response and no executable work. Nothing is queued. "
+                    "Return an actual work_order for the next step, or a substantive response with available findings and limitations."})
+                if count == 1:
+                    tx.enqueue(pid, holon_id, "turn", {"reason": "empty_turn_recovery"})
+                else:
+                    _block(tx, project, holon, "error", "The model returned progress without an answer or action twice. Retry to continue.")
+        elif work_scope(holon) == "research" and runnable and not decision.completion:
+            active_children = [
+                h
+                for h in tx.list("holons", project_id=pid, parent_id=holon_id)
+                if h.get("status") != "completed"
+            ]
+            if active_children:
+                tx.update("holons", holon_id, {"empty_turn_count": 0, "runtime_feedback": None})
+            else:
+                count = int(holon.get("empty_turn_count", 0)) + 1
+                tx.update("holons", holon_id, {"empty_turn_count": count, "runtime_feedback":
+                    "Continuous research cannot advance through another response-only turn. "
+                    "Create and delegate valuable independent branches, run the next useful tool, "
+                    "or return completion if the objective has reached a defensible stopping point."})
+                if count == 1:
+                    tx.enqueue(pid, holon_id, "turn", {"reason": "research_action_recovery"})
+                else:
+                    _block(
+                        tx,
+                        project,
+                        holon,
+                        "no_research_action",
+                        "Continuous research produced no action twice. Review the direction before resuming.",
+                    )
+        elif runnable and holon_id == project.get("root_holon_id") and not decision.response:
             count = int(holon.get("empty_turn_count", 0)) + 1
             tx.update("holons", holon_id, {"empty_turn_count": count, "runtime_feedback":
                 "Your last decision contained no response and no executable work. Nothing is queued. "
@@ -1575,6 +2149,9 @@ async def execute_work_order(store: Any, holon_id: str, work_order: dict, tool_d
         project = tx.get("projects", pid)
         if not _runnable(tx, project, holon):
             return {"status": "skipped"}
+        request = conversation_request(project, work_scope(holon))
+        if request and request.get("tool_calls", 0) >= request.get("max_tool_calls", 6):
+            raise RuntimeRejected("The bounded conversation has reached its tool-action limit")
         node = _local_node(tx, work_order["node_id"], holon)
         _validate_arguments(tx, work_order.get("arguments", {}), holon)
         try:
@@ -1582,6 +2159,24 @@ async def execute_work_order(store: Any, holon_id: str, work_order: dict, tool_d
         except RuntimeRejected:
             _block(tx, project, holon, "budget", "The proposed work exceeds the available research budget.")
             return {"status": "blocked"}
+        if request:
+            history = list(request.get("tool_history", []))
+            history.append(
+                {
+                    "kind": work_order["kind"],
+                    "arguments": _public(work_order.get("arguments", {})),
+                    "holon_id": holon_id,
+                }
+            )
+            update_request(
+                tx,
+                pid,
+                work_scope(holon),
+                {
+                    "tool_calls": request.get("tool_calls", 0) + 1,
+                    "tool_history": history[-12:],
+                },
+            )
         tx.event(
             pid,
             "WORK_ASSIGNED",
@@ -1733,8 +2328,16 @@ async def execute_work_order(store: Any, holon_id: str, work_order: dict, tool_d
     }
 
 
-async def route_evidence(store: Any, evidence_id: str, model: Any) -> dict:
+async def route_evidence(store: Any, evidence_id: str, model: Any, *, cache_dir=None) -> dict:
     """Indexed candidate retrieval, followed by one model impact assessment."""
+    semantic = None
+    if cache_dir is not None:
+        with store.transaction() as tx:
+            source = tx.get("evidence", evidence_id)
+            candidates_rows = tx.list("holons", project_id=source["project_id"]) if source else []
+        if source:
+            from .retrieval import rank_candidates
+            semantic = await asyncio.to_thread(rank_candidates, source.get("summary", ""), candidates_rows, cache_dir, 20)
     with store.transaction() as tx:
         evidence = tx.get("evidence", evidence_id)
         if not evidence:
@@ -1750,11 +2353,13 @@ async def route_evidence(store: Any, evidence_id: str, model: Any) -> dict:
             return {"status": "deferred", "cost_usd": 0}
         candidates = []
         if callable(getattr(tx, "routing_candidates", None)):
-            retrieved = tx.routing_candidates(pid, evidence.get("summary", ""), limit=20)
+            retrieved = semantic if semantic is not None else tx.routing_candidates(pid, evidence.get("summary", ""), limit=20)
             backend = getattr(getattr(tx, "conn", None), "dialect", None)
             retrieval = (
                 "pgvector_token_hash" if getattr(backend, "name", None) == "postgresql" else "token_hash"
             )
+            if semantic:
+                retrieval = semantic[0].get("retrieval", retrieval)
             for item in retrieved:
                 recipient = _owned(tx, "holons", item.get("holon_id", item.get("id")), pid)
                 if recipient["id"] != evidence["producer_holon_id"] and _runnable(tx, project, recipient):

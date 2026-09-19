@@ -11,6 +11,7 @@ import {
   ProjectData,
   RecordItem,
   ResearchEvent,
+  ConversationReference,
 } from "@/lib/api";
 import {
   AlertCircle,
@@ -22,6 +23,8 @@ import {
   ShieldCheck,
   Sparkles,
   Square,
+  GitBranch,
+  X,
 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Mark, Markdown } from "./ui";
@@ -33,6 +36,9 @@ export function Conversation({
   onRefresh,
   onSettings,
   onError,
+  reference,
+  onClearReference,
+  visible = true,
 }: {
   project: Project;
   data: ProjectData;
@@ -40,6 +46,9 @@ export function Conversation({
   onRefresh: () => void;
   onSettings: () => void;
   onError: (error: string) => void;
+  reference?: ConversationReference | null;
+  onClearReference?: () => void;
+  visible?: boolean;
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -54,17 +63,14 @@ export function Conversation({
   const jobs = (
     Array.isArray(data.stats.jobs) ? data.stats.jobs : []
   ) as RecordItem[];
-  const rootJobs = jobs.filter(
-    (job) =>
-      job.holon_id === project.root_holon_id &&
-      ["running", "queued"].includes(String(job.state)),
-  );
+  const scope = project.active_conversation_id ? `conversation:${project.active_conversation_id}` : null;
+  const rootJobs = jobs.filter(job => {
+    const payload = (job.payload || {}) as Record<string, unknown>;
+    return scope && payload.work_scope === scope && ["running", "queued"].includes(String(job.state));
+  });
   const busy =
     sending ||
-    (!root?.chat_stopped &&
-      project.status === "active" &&
-      root?.status === "active" &&
-      (rootJobs.length > 0 || sending));
+    (!root?.chat_stopped && rootJobs.length > 0);
   const pending = data.attention.filter(
     (item) =>
       item.status === "pending" && item.holon_id === project.root_holon_id,
@@ -125,6 +131,7 @@ export function Conversation({
         behavior: "smooth",
       });
   }, [data.messages.length, tools.length, atBottom]);
+  useEffect(() => { if (visible) input.current?.focus(); }, [visible, reference?.nodeId]);
   async function send(event?: FormEvent) {
     event?.preventDefault();
     if (!draft.trim() || sending) return;
@@ -134,7 +141,7 @@ export function Conversation({
     try {
       await api(`/projects/${project.id}/messages`, {
         method: "POST",
-        body: JSON.stringify({ text: message }),
+        body: JSON.stringify({ text: message, node_ids: reference ? [reference.nodeId] : [], attention_ids: reference?.attentionIds || [] }),
       });
       setDraft("");
       onRefresh();
@@ -277,6 +284,7 @@ export function Conversation({
                   </strong>
                   <time>{date(entry.message.created_at)}</time>
                 </header>
+                {!!entry.message.node_ids?.length && <div className="message-node-refs">{entry.message.node_ids.map(id => <span key={id} title={id}><GitBranch size={11} />{id.slice(0, 8)}</span>)}</div>}
                 <Markdown>{entry.message.text}</Markdown>
               </article>
             ),
@@ -359,18 +367,9 @@ export function Conversation({
             <Square size={11} />
             <div>Response stopped. Send a message to continue.</div>
           </div>
-        ) : project.status === "paused" && data.messages.length > 0 ? (
+        ) : project.research_state === "paused" ? (
           <div className="chat-activity">
-            <div>Project paused. Your messages will be saved.</div>
-            <button
-              onClick={() =>
-                void api(`/projects/${project.id}/resume`, { method: "POST" })
-                  .then(onRefresh)
-                  .catch((err) => onError(errorText(err)))
-              }
-            >
-              Resume
-            </button>
+            <div>Autoresearch paused. We can keep thinking together.</div>
           </div>
         ) : (
           <div className="chat-activity">
@@ -378,6 +377,7 @@ export function Conversation({
           </div>
         )}
         <form className="chat-composer" onSubmit={send}>
+          {reference && <div className="composer-reference"><GitBranch size={13} /><span title={reference.nodeId}>{reference.title}<small>{reference.nodeId.slice(0, 8)}</small></span><button type="button" className="icon-button" aria-label="Remove node reference" onClick={onClearReference}><X size={13} /></button></div>}
           <textarea
             ref={input}
             aria-label="Message Sapling"

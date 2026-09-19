@@ -27,6 +27,19 @@ def stop(process):
             process.kill()
 
 
+def wait_ready(url: str, processes: list[subprocess.Popen], attempts: int = 120) -> bool:
+    for _ in range(attempts):
+        if any(process.poll() is not None for process in processes):
+            return False
+        try:
+            with urllib.request.urlopen(url, timeout=1) as response:
+                if response.status == 200:
+                    return True
+        except (urllib.error.URLError, TimeoutError):
+            time.sleep(0.5)
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sapling — local autonomous research")
     parser.add_argument(
@@ -70,6 +83,8 @@ def main():
                 creationflags=flags,
             )
         )
+        if not wait_ready("http://127.0.0.1:8000/docs", processes):
+            parser.exit(1, "Sapling's research runtime did not become ready. Check the log above.\n")
         if not args.api_only:
             node = shutil.which("node")
             if not node:
@@ -90,16 +105,7 @@ def main():
                 )
             )
         url = "http://127.0.0.1:8000/docs" if args.api_only else "http://127.0.0.1:3000"
-        for _ in range(120):
-            if any(p.poll() is not None for p in processes):
-                parser.exit(1, "A Sapling service exited. Check the log above.\n")
-            try:
-                with urllib.request.urlopen(url, timeout=1) as response:
-                    if response.status == 200:
-                        break
-            except (urllib.error.URLError, TimeoutError):
-                time.sleep(0.5)
-        else:
+        if not wait_ready(url, processes):
             parser.exit(1, "Sapling did not become ready within 60 seconds.\n")
         print(f"Sapling is running at {url}. Press Ctrl+C to stop the runtime.")
         if not args.no_browser:

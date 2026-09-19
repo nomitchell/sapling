@@ -7,13 +7,16 @@ directory and disables networking unless that separate capability is approved.
 
 import asyncio
 import hashlib
+import io
 import json
 import os
+import platform
 import re
 import shutil
 import signal
 import subprocess
 import time
+import tarfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
@@ -65,6 +68,8 @@ class Workspace:
     path: Path
     metadata_path: Path
     parent_commit: str | None = None
+    source_experiment_id: str | None = None
+    source_commit: str | None = None
 
     def write_file(self, relative_path: str, content: str) -> Path:
         path = contained_path(self.path, relative_path)
@@ -182,7 +187,7 @@ class LocalProcessBackend:
         if not workspace.path.resolve().is_relative_to(self.root) or not workspace.metadata_path.resolve().is_relative_to(self.root):
             raise WorkspaceViolation("Workspace cannot escape the execution root.")
 
-    async def _git(self, workspace: Workspace, *arguments: str, check: bool = True) -> str:
+    async def _git(self, workspace: Workspace, *arguments: str, check: bool = True, binary: bool = False) -> str | bytes:
         if not shutil.which("git"):
             raise ExecutionUnavailable("Git must be installed to record reproducible experiment snapshots.")
         process = await asyncio.create_subprocess_exec("git", f"--git-dir={workspace.metadata_path / 'repository.git'}", f"--work-tree={workspace.path}", "-c", "core.longpaths=true", "-c", "core.hooksPath=", "-c", "commit.gpgsign=false", *arguments, cwd=workspace.path, env=sanitized_environment(workspace.path), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -195,7 +200,7 @@ class LocalProcessBackend:
             raise
         if check and process.returncode:
             raise ExecutionUnavailable(f"Git snapshot failed: {stderr.decode(errors='replace')[:1000]}")
-        return stdout.decode(errors="replace").strip()
+        return stdout if binary else stdout.decode(errors="replace").strip()
 
     async def create_workspace(self, project_id: str, experiment_id: str, source_dir: str | Path | None = None) -> Workspace:
         base = contained_path(self.root, Path(_identifier(project_id)) / _identifier(experiment_id))
@@ -229,12 +234,105 @@ class LocalProcessBackend:
         commit = await self.snapshot(workspace, "Initial experiment workspace")
         return Workspace(project_id, experiment_id, code, records, commit)
 
+    async def fork_workspace(self, project_id: str, experiment_id: str,
+                             parent_experiment_id: str, parent_commit: str) -> Workspace:
+        """Materialize an exact recorded input snapshot, never mutable outputs."""
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", parent_commit):
+            raise WorkspaceViolation("A parent snapshot must be an exact Git commit identifier.")
+        parent_base = contained_path(self.root, Path(_identifier(project_id)) / _identifier(parent_experiment_id))
+        parent = Workspace(project_id, parent_experiment_id, parent_base / "code", parent_base / "records")
+        self._validate(parent)
+        if not (parent.metadata_path / "repository.git").is_dir():
+            raise WorkspaceViolation("The parent experiment snapshot does not exist in this project.")
+        archive = await self._git(parent, "archive", "--format=tar", parent_commit, binary=True)
+        if len(archive) > self.max_artifact_bytes + self.max_artifact_files * 2048:
+            raise WorkspaceViolation("Parent snapshot exceeds the workspace size limit.")
+        workspace = await self.create_workspace(project_id, experiment_id)
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
+            entries, size = 0, 0
+            for member in bundle:
+                if not member.isfile() and not member.isdir():
+                    raise WorkspaceViolation("Parent snapshots cannot contain links or special files.")
+                target = contained_path(workspace.path, member.name)
+                if ".git" in Path(member.name).parts:
+                    raise WorkspaceViolation("Parent snapshots cannot overwrite Git metadata.")
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                entries += 1
+                size += member.size
+                if entries > self.max_artifact_files or size > self.max_artifact_bytes:
+                    raise WorkspaceViolation("Parent snapshot exceeds workspace limits.")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with bundle.extractfile(member) as source, target.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+        commit = await self.snapshot(workspace, f"Derived from {parent_experiment_id}@{parent_commit}")
+        lineage = {"parent_experiment_id": parent_experiment_id, "parent_commit": parent_commit}
+        (workspace.metadata_path / "lineage.json").write_text(json.dumps(lineage), encoding="utf-8")
+        return Workspace(project_id, experiment_id, workspace.path, workspace.metadata_path,
+                         commit, parent_experiment_id, parent_commit)
+
     async def snapshot(self, workspace: Workspace, message: str = "Experiment inputs") -> str:
         self._validate(workspace)
         await self.collect_artifacts(workspace)
         await self._git(workspace, "add", "--all")
         await self._git(workspace, "-c", "user.name=Sapling", "-c", "user.email=sapling@localhost", "commit", "--allow-empty", "--quiet", "-m", message)
         return await self._git(workspace, "rev-parse", "HEAD")
+
+    async def evaluate(self, candidate: Workspace, files: dict[str, str], command: list[str],
+                       *, timeout_seconds: float = 300, config: dict | None = None,
+                       expected_version: str | None = None, run_id: str | None = None) -> dict:
+        """Run a versioned evaluator separately from the candidate workspace.
+
+        The evaluator reads copied outputs under candidate/. This is provenance
+        and an integrity check, not a claim that agent-authored metrics are true
+        or that native processes are an adversarial security boundary.
+        """
+        self._validate(candidate)
+        if not files or len(files) > 100 or any(not isinstance(k, str) or not isinstance(v, str)
+                                               for k, v in files.items()):
+            raise WorkspaceViolation("Evaluator files must be a nonempty text-file map.")
+        if sum(len(v.encode()) for v in files.values()) > 2_000_000:
+            raise WorkspaceViolation("Evaluator source exceeds the size limit.")
+        configuration = {"files": files, "command": command, "config": config or {}}
+        encoded = json.dumps(configuration, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
+        version = hashlib.sha256(encoded).hexdigest()
+        if expected_version is not None and version != expected_version:
+            raise WorkspaceViolation("Evaluator content differs from the requested evaluation version.")
+        evaluation_id = _identifier(run_id or f"eval-{uuid4()}")
+        evaluation = await self.create_workspace(candidate.project_id, evaluation_id)
+        for name, content in files.items():
+            if Path(name).parts[0] == "candidate" or name == "evaluation-config.json":
+                raise WorkspaceViolation("Evaluator source cannot replace candidate inputs or configuration.")
+            evaluation.write_file(name, content)
+        evaluation.write_file("evaluation-config.json", json.dumps(config or {}, allow_nan=False))
+        original = await self.collect_artifacts(candidate)
+        for artifact in original:
+            destination = contained_path(evaluation.path, Path("candidate") / artifact.relative_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(artifact.path, destination)
+        expected = {item.relative_path: item.sha256 for item in await self.collect_artifacts(evaluation)}
+        result = await self.run(evaluation, command, timeout_seconds, run_id=evaluation_id)
+        actual = {item.relative_path: item.sha256 for item in await self.collect_artifacts(evaluation)}
+        intact = all(actual.get(name) == digest for name, digest in expected.items())
+        metrics = None
+        if result.exit_code == 0 and not result.cancelled and not result.timed_out and intact:
+            try:
+                parsed = json.loads(result.stdout, parse_constant=lambda _: None)
+                metrics = parsed if isinstance(parsed, dict) else None
+            except ValueError:
+                pass
+        record = {
+            "evaluator_version": version, "candidate_experiment_id": candidate.experiment_id,
+            "input_hashes": {item.relative_path: item.sha256 for item in original},
+            "configuration": configuration, "result": asdict(result), "metrics": metrics,
+            "inputs_unchanged": intact, "metrics_are_untrusted": True,
+            "verification": "versioned_evaluator" if intact else "evaluation_inputs_modified",
+            "isolation": "container" if self.backend_name == "local_docker" else "native_process",
+        }
+        (candidate.metadata_path / f"{evaluation_id}.evaluation.json").write_text(
+            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        return record
 
     def _command(self, workspace: Workspace, command: list[str], run_id: str) -> list[str]:
         return command
@@ -280,6 +378,7 @@ class LocalProcessBackend:
         if run_id in self._running or (workspace.metadata_path / f"{run_id}.json").exists():
             raise ValueError("Run identifiers must be unique.")
         commit = await self.snapshot(workspace)
+        input_artifacts = [asdict(item) for item in await self.collect_artifacts(workspace)]
         actual_command = self._command(workspace, command, run_id)
         output_paths = [workspace.metadata_path / f"{run_id}.{stream}.log" for stream in ("stdout", "stderr")]
         start = time.monotonic()
@@ -344,7 +443,13 @@ class LocalProcessBackend:
         manifest_path = workspace.metadata_path / f"{run_id}.json"
         result = ExecutionResult(run_id, process.returncode if process.returncode is not None else -1, stdout, stderr, time.monotonic() - start, timed_out, running.cancelled, commit, str(output_paths[0]), str(output_paths[1]), str(manifest_path), artifacts, self.backend_name)
         manifest = asdict(result)
-        manifest.update({"command": command, "timeout_seconds": timeout_seconds, "parent_commit": workspace.parent_commit, "environment": {"backend": self.backend_name, "credentials_inherited": False, "platform": os.name}})
+        manifest.update({"command": command, "timeout_seconds": timeout_seconds,
+                         "parent_commit": workspace.parent_commit,
+                         "source_experiment_id": workspace.source_experiment_id,
+                         "source_commit": workspace.source_commit,
+                         "inputs": input_artifacts,
+                         "environment": {"backend": self.backend_name, "credentials_inherited": False,
+                                         "platform": platform.platform(), "runtime_python": platform.python_version()}})
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return result
 

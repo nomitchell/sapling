@@ -11,7 +11,7 @@ def is_placeholder(key: str | None) -> bool:
 
 class CredentialVault:
     def set(self, provider: str, key: str):
-        if provider not in {"openai", "openalex", "tavily"}:
+        if provider not in {"openai", "baseten", "openalex", "tavily"}:
             raise ValueError("Unknown credential provider")
         if is_placeholder(key):
             raise ValueError("Enter an actual API key; placeholders are not stored")

@@ -117,6 +117,49 @@ class Store:
                 conn.execute(versions.insert().values(version=1))
             elif version != 1:
                 raise RuntimeError(f"Unsupported database schema {version}; application expects 1")
+        # Idempotent JSON migration: legacy activity is never inferred as consent.
+        with self.transaction() as tx:
+            for project in tx.list("projects"):
+                if "research_state" not in project:
+                    tx.update("projects", project["id"], {
+                        "research_state": "planning", "research_epoch": 0,
+                        "research_invitation": None, "conversation_requests": {},
+                        "active_conversation_id": None,
+                        "status": "archived" if project.get("status") == "archived" else "active",
+                    })
+            for item in tx.list("attention_items"):
+                if "read_at" not in item:
+                    owner = tx.get("holons", item.get("holon_id"))
+                    tx.update("attention_items", item["id"], {"read_at": None,
+                        "node_id": (owner or {}).get("assigned_node_id"),
+                        "pauses_subtree": item.get("pauses_subtree", item.get("type") != "research_decision")})
+            running = set(tx.conn.execute(select(jobs.c.holon_id).where(jobs.c.state == "running")).scalars())
+            for holon in tx.list("holons"):
+                if holon["id"] in running or not holon.get("budget_reserved"):
+                    continue
+                latest = tx.conn.execute(
+                    select(jobs).where(jobs.c.holon_id == holon["id"])
+                    .order_by(jobs.c.created_at.desc()).limit(1)
+                ).mappings().first()
+                scope = (latest or {}).get("payload", {}).get("work_scope", holon.get("work_scope", "research"))
+                self._reconcile_reservation(tx, holon, scope, "orphaned reservation recovered at startup")
+
+    @staticmethod
+    def _reconcile_reservation(tx, holon: dict, scope: str, reason: str) -> None:
+        """Conservatively charge a reservation whose external action may have run."""
+        amount = float(holon.get("budget_reserved") or 0)
+        if amount <= 0:
+            return
+        from .runtime import CURRENT_SCOPE, _settle
+
+        token = CURRENT_SCOPE.set(scope)
+        try:
+            _settle(tx, holon["project_id"], holon["id"], amount, amount, {}, estimated=True)
+        finally:
+            CURRENT_SCOPE.reset(token)
+        tx.event(holon["project_id"], "RESERVATION_RECONCILED", {
+            "holon_id": holon["id"], "amount_usd": amount, "reason": reason,
+        })
 
     @contextmanager
     def transaction(self):
@@ -145,6 +188,13 @@ class Store:
                 )
                 holon = tx.get("holons", row["holon_id"])
                 if holon:
+                    self._reconcile_reservation(
+                        tx,
+                        holon,
+                        row["payload"].get("work_scope", holon.get("work_scope", "research")),
+                        "worker lease expired",
+                    )
+                    holon = tx.get("holons", row["holon_id"])
                     tx.update(
                         "holons",
                         holon["id"],
@@ -155,8 +205,12 @@ class Store:
                     {
                         "project_id": row["project_id"],
                         "holon_id": row["holon_id"],
+                        "node_id": (holon or {}).get("assigned_node_id"),
+                        "work_scope": row["payload"].get("work_scope", "research"),
                         "type": "interrupted_job",
                         "status": "pending",
+                        "read_at": None,
+                        "pauses_subtree": True,
                         "summary": "A worker stopped during a job. Review before retrying.",
                         "job_id": row["id"],
                     },
@@ -173,13 +227,15 @@ class Store:
             for row in candidates:
                 project = tx.get("projects", row["project_id"])
                 holon = tx.get("holons", row["holon_id"])
-                if (
-                    not project
-                    or project["status"] != "active"
-                    or not holon
-                    or holon["status"] in {"paused", "completed", "error", "blocked"}
-                    or holon.get("chat_stopped")
-                ):
+                from .runtime import _runnable
+                scope = row["payload"].get("work_scope", (holon or {}).get("work_scope", "research"))
+                # Exact-action approval jobs can run while the owning holon awaits permission.
+                runnable_holon = holon
+                if holon and row["kind"] == "work_order" and row["payload"].get("attention_id"):
+                    approval = tx.get("attention_items", row["payload"]["attention_id"])
+                    if approval and approval.get("approved"):
+                        runnable_holon = {**holon, "status": "active"}
+                if not _runnable(tx, project, runnable_holon, scope):
                     continue
                 if row["holon_id"] in running:
                     continue
@@ -281,6 +337,9 @@ class Tx:
         return record
 
     def event(self, project_id: str, type: str, payload: dict) -> dict:
+        from .runtime import CURRENT_SCOPE
+        if CURRENT_SCOPE.get() and "work_scope" not in payload:
+            payload = {**payload, "work_scope": CURRENT_SCOPE.get()}
         record = {
             "project_id": project_id,
             "type": type,
@@ -291,17 +350,27 @@ class Tx:
         return {"id": result.inserted_primary_key[0], **record}
 
     def enqueue(self, project_id: str, holon_id: str, kind: str, payload: dict, priority=0) -> dict:
+        from .runtime import CURRENT_SCOPE
+        owner = self.get("holons", holon_id)
+        scope = payload.get("work_scope") or CURRENT_SCOPE.get() or (owner or {}).get("work_scope", "research")
+        # A recipient never acquires the sender's broader/narrower work authority.
+        if owner and owner.get("parent_id"):
+            scope = owner.get("work_scope", "research")
+        payload = {**payload, "work_scope": scope}
+        if scope.startswith("conversation:"):
+            priority += 100
         # Coalesce queued wakes; events and human inputs remain in canonical state.
         if kind == "turn":
-            existing = (
+            existing_rows = (
                 self.conn.execute(
                     select(jobs).where(
                         jobs.c.holon_id == holon_id, jobs.c.kind == kind, jobs.c.state == "queued"
                     )
                 )
                 .mappings()
-                .first()
+                .all()
             )
+            existing = next((row for row in existing_rows if row["payload"].get("work_scope", "research") == scope), None)
             if existing:
                 return dict(existing)
         record = {
@@ -318,12 +387,11 @@ class Tx:
         self.conn.execute(jobs.insert().values(**record))
         return record
 
-    def cancel_queued(self, holon_id: str):
-        self.conn.execute(
-            update(jobs)
-            .where(jobs.c.holon_id == holon_id, jobs.c.state == "queued")
-            .values(state="cancelled")
-        )
+    def cancel_queued(self, holon_id: str, scope: str | None = None):
+        candidates = self.conn.execute(select(jobs).where(jobs.c.holon_id == holon_id, jobs.c.state == "queued")).mappings().all()
+        for row in candidates:
+            if scope is None or row["payload"].get("work_scope", "research") == scope:
+                self.conn.execute(update(jobs).where(jobs.c.id == row["id"]).values(state="cancelled"))
 
     def _index_holon(self, record):
         if self.conn.dialect.name != "postgresql":

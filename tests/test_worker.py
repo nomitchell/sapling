@@ -34,6 +34,11 @@ def create_project(fixture, mode="ask", **settings):
     response = client.post("/projects", json={"title": "Worker integration", "settings": {"permission_mode": mode, "execution_backend": "process", **settings}})
     assert response.status_code == 201, response.text
     project = response.json()
+    # These worker tests begin after consent; lifecycle tests cover the actual
+    # invitation/conversation handshake separately.
+    with store.transaction() as tx:
+        human = tx.create("human_inputs", {"project_id": project["id"], "text": "Start pair research"})
+        tx.update("projects", project["id"], {"research_invitation": {"id": "worker-test-invitation", "accepted_human_input_id": human["id"]}})
     assert client.post(f"/projects/{project['id']}/resume").status_code == 200
     with store.transaction() as tx:
         return tx.get("projects", project["id"]), tx.get("holons", project["root_holon_id"])
@@ -67,7 +72,8 @@ async def test_missing_key_preserves_human_input_and_creates_one_configuration_a
     with store.transaction() as tx:
         inputs = tx.list("human_inputs", project["id"])
         attention = tx.list("attention_items", project["id"], type="configuration")
-        assert len(inputs) == 1 and inputs[0]["text"] == text
+        matching = [item for item in inputs if item["text"] == text]
+        assert len(matching) == 1
         assert len(attention) == 1 and "API key" in attention[0]["summary"]
         assert tx.get("holons", holon["id"])["status"] == "blocked"
         assert tx.get("projects", project["id"])["budget_spent"] == 0
@@ -210,10 +216,10 @@ async def test_experiment_timeout_is_recorded_as_timeout_evidence(worker_app):
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not shutil.which("git"), reason="Git required for real execution")
-async def test_project_pause_cancels_running_experiment_and_keeps_provenance(worker_app):
+async def test_project_pause_finishes_bounded_experiment_and_keeps_provenance(worker_app):
     client, store, worker, _ = worker_app
     project, holon = create_project(worker_app, mode="yolo", experiment_timeout=30)
-    order = work_order(holon, script="from pathlib import Path\nimport time\nPath('started.txt').write_text('started')\ntime.sleep(30)", timeout=30)
+    order = work_order(holon, script="from pathlib import Path\nimport time\nPath('started.txt').write_text('started')\ntime.sleep(1)\nprint('finished bounded action')", timeout=10)
     task = asyncio.create_task(worker.perform(job(project, holon, order)))
     try:
         for _ in range(200):
@@ -223,7 +229,7 @@ async def test_project_pause_cancels_running_experiment_and_keeps_provenance(wor
                 break
             if task.done():
                 await task
-                pytest.fail("Experiment finished before cancellation could be tested")
+                pytest.fail("Experiment finished before pause could be tested")
             await asyncio.sleep(0.025)
         else:
             pytest.fail("Experiment did not start in time")
@@ -235,10 +241,11 @@ async def test_project_pause_cancels_running_experiment_and_keeps_provenance(wor
             await asyncio.gather(task, return_exceptions=True)
     with store.transaction() as tx:
         experiment = tx.list("experiments", project["id"])[0]
-        assert experiment["status"] == "cancelled"
-        assert experiment["result"]["cancelled"] and not experiment["result"]["timed_out"]
+        assert experiment["status"] == "completed"
+        assert not experiment["result"]["cancelled"] and not experiment["result"]["timed_out"]
+        assert "finished bounded action" in experiment["result"]["stdout"]
         evidence = tx.list("evidence", project["id"])[0]
-        assert evidence["scope"]["cancelled"]
+        assert not evidence["scope"]["cancelled"]
         assert evidence["artifact_ids"]
 
 

@@ -85,7 +85,8 @@ export function ModelFields({
       active = false;
     };
   }, []);
-  const selected = catalog.models.find((model) => model.id === value.model);
+  const models = catalog.models.filter(model => (model.provider || "openai") === value.provider);
+  const selected = models.find((model) => model.id === value.model);
   const set = (key: keyof ResearchSettings, next: string | number | null) =>
     onChange({ ...value, [key]: next });
   function selectModel(id: string) {
@@ -93,13 +94,13 @@ export function ModelFields({
       setCustom(true);
       return;
     }
-    const model = catalog.models.find((item) => item.id === id);
+    const model = models.find((item) => item.id === id);
     if (model) {
       const effort =
         value.reasoning_effort &&
         model.reasoning_efforts.includes(value.reasoning_effort)
           ? value.reasoning_effort
-          : "low";
+          : model.default_reasoning_effort ?? (model.reasoning_efforts.includes("low") ? "low" : model.reasoning_efforts[0] || null);
       onChange({
         ...value,
         model: id,
@@ -117,13 +118,19 @@ export function ModelFields({
     (!value.input_cost_per_million || !value.output_cost_per_million);
   return (
     <>
+      <Row name="Provider"><select aria-label="Model provider" value={value.provider} onChange={event => {
+        const provider = event.target.value;
+        const next = catalog.models.find(model => (model.provider || "openai") === provider);
+        setCustom(false);
+        onChange({ ...value, provider, model: next?.id || "", reasoning_effort: next?.default_reasoning_effort ?? next?.reasoning_efforts[0] ?? null, input_cost_per_million: next?.input_cost_per_million || 0, output_cost_per_million: next?.output_cost_per_million || 0, cached_input_cost_per_million: next?.cached_input_cost_per_million ?? null });
+      }}><option value="openai">OpenAI</option><option value="baseten">Baseten</option></select></Row>
       <Row name="Model">
         <select
           aria-label="Model"
           value={custom || !selected ? "custom" : value.model}
           onChange={(event) => selectModel(event.target.value)}
         >
-          {catalog.models.map((model) => (
+          {models.map((model) => (
             <option
               key={model.id}
               value={model.id}
@@ -144,7 +151,7 @@ export function ModelFields({
             value={value.model}
             onChange={(event) => {
               const id = event.target.value;
-              if (catalog.models.some((item) => item.id === id)) {
+              if (models.some((item) => item.id === id)) {
                 selectModel(id);
               } else
                 onChange({
@@ -159,7 +166,7 @@ export function ModelFields({
           />
         </Row>
       )}
-      <Row name="Reasoning">
+      {(!selected || !["fixed", "none"].includes(selected.reasoning_control || "effort")) && <Row name="Reasoning" hint={selected?.reasoning_note}>
         <select
           aria-label="Reasoning"
           value={value.reasoning_effort ?? "default"}
@@ -170,16 +177,16 @@ export function ModelFields({
             )
           }
         >
-          {!selected && <option value="default">Model default</option>}
+          {(!selected || !selected.reasoning_efforts.length) && <option value="default">Model default</option>}
           {(selected?.reasoning_efforts || Object.keys(efforts)).map(
             (effort) => (
               <option key={effort} value={effort}>
-                {efforts[effort]}
+                {selected?.reasoning_control === "toggle" ? effort === "none" ? "Off" : "On" : efforts[effort] || effort}
               </option>
             ),
           )}
         </select>
-      </Row>
+      </Row>}
       {error && (
         <p className="settings-note">
           Using the saved model catalog. Account availability could not be
@@ -257,7 +264,7 @@ export function SettingsPanel({
   const [title, setTitle] = useState(project?.title || "");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const set = (key: keyof ResearchSettings, value: string | number) =>
+  const set = (key: keyof ResearchSettings, value: string | number | null) =>
     setConfig((current) => ({ ...current, [key]: value }));
   async function save() {
     setBusy(true);
@@ -418,9 +425,9 @@ export function SettingsPanel({
               </Row>
               <details className="settings-details">
                 <summary>Advanced limits</summary>
+                <Row name="Research depth" hint="Automatic lets the question and budget determine depth."><div className="depth-setting"><select aria-label="Research depth" value={config.max_depth === null ? "automatic" : "limited"} onChange={event => set("max_depth", event.target.value === "automatic" ? null : 5)}><option value="automatic">Automatic</option><option value="limited">Set a limit</option></select>{config.max_depth !== null && <input aria-label="Maximum depth" type="number" min="1" max="20" value={config.max_depth} onChange={event => set("max_depth", Number(event.target.value))} />}</div></Row>
                 {(
                   [
-                    ["max_depth", "Maximum depth", 1, 20],
                     [
                       "experiment_timeout",
                       "Experiment timeout (seconds)",
@@ -496,7 +503,7 @@ function Connections() {
   useEffect(load, []);
   return (
     <>
-      {["openai", "openalex", "tavily"].map((provider) => (
+      {["openai", "baseten", "openalex", "tavily"].map((provider) => (
         <Connection
           key={provider}
           provider={provider}
@@ -549,6 +556,8 @@ function Connection({
           <strong>
             {provider === "openai"
               ? "OpenAI"
+              : provider === "baseten"
+                ? "Baseten"
               : provider === "tavily"
                 ? "Tavily"
                 : "OpenAlex"}

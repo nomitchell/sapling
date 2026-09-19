@@ -6,16 +6,17 @@ import {
   emptyData,
   errorText,
   loadEvents,
+  money,
+  ConversationReference,
   Project,
   ProjectData,
   ResearchSettings,
 } from "@/lib/api";
 import {
-  Activity,
   ArrowRight,
   CirclePause,
   Folder,
-  GitBranch,
+  ChevronDown,
   Loader2,
   Menu,
   MessageSquare,
@@ -35,33 +36,27 @@ import {
 } from "react";
 import { useAppearance } from "./appearance";
 import { Conversation } from "./conversation";
+import { ResearchCanvas } from "./research-canvas";
 import {
   Commons,
   Experiments,
   Holarchy,
   Operations,
-  ResearchTree,
 } from "./research-views";
 import { SettingsPanel } from "./settings-panel";
 import { Markdown, Modal } from "./ui";
 
-type Tab = "converse" | "research" | "activity";
-type ResearchTab =
-  "brief" | "tree" | "knowledge" | "researchers" | "experiments";
-const researchTabs = [
-  { id: "brief", label: "Direction" },
-  { id: "tree", label: "Tree" },
-  { id: "knowledge", label: "Knowledge" },
-  { id: "researchers", label: "Researchers" },
-  { id: "experiments", label: "Experiments" },
-] as const;
+type Inspection = "direction" | "knowledge" | "researchers" | "experiments" | "activity";
 
 export function Workspace() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [data, setData] = useState<ProjectData>(emptyData);
-  const [tab, setTab] = useState<Tab>("converse");
-  const [researchTab, setResearchTab] = useState<ResearchTab>("brief");
+  const [converseOpen, setConverseOpen] = useState(true);
+  const [reference, setReference] = useState<ConversationReference | null>(null);
+  const [inspection, setInspection] = useState<Inspection | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const converseToggle = useRef<HTMLButtonElement>(null);
   const [globalSettings, setGlobalSettings] =
     useState<ResearchSettings>(defaults);
   const [loading, setLoading] = useState(true);
@@ -173,14 +168,16 @@ export function Workspace() {
   }
   function select(id: string) {
     setSelectedId(id);
-    setTab("converse");
+    setConverseOpen(true);
+    setReference(null);
+    setInspection(null);
     setSidebar(false);
   }
   async function control() {
     if (!selected) return;
     try {
       await api(
-        `/projects/${selected.id}/${selected.status === "active" ? "pause" : "resume"}`,
+        `/projects/${selected.id}/${selected.research_state === "running" ? "pause" : "resume"}`,
         { method: "POST" },
       );
       refresh();
@@ -188,18 +185,11 @@ export function Workspace() {
       setError(errorText(err));
     }
   }
-  const pending = data.attention.filter(
-    (item) =>
-      item.status === "pending" &&
-      !(
-        item.type === "research_decision" &&
-        item.holon_id === selected?.root_holon_id
-      ),
-  );
-  const hasResearch =
-    data.tree.length > 1 ||
-    data.holarchy.length > 1 ||
-    data.experiments.length > 0;
+  function discuss(next?: ConversationReference) {
+    if (next) setReference(next);
+    setConverseOpen(true);
+  }
+  const researchState = selected?.research_state || "planning";
   return (
     <div className="workspace-app">
       <aside className={`app-sidebar ${sidebar ? "open" : ""}`}>
@@ -265,31 +255,9 @@ export function Workspace() {
             <Menu size={18} />
           </button>
           <span className="project-name">{selected?.title || "Workspace"}</span>
-          {selected && (
-            <nav className="main-tabs" aria-label="Project sections">
-              {(
-                [
-                  { id: "converse", name: "Converse", icon: MessageSquare },
-                  { id: "research", name: "Research", icon: GitBranch },
-                  { id: "activity", name: "Activity", icon: Activity },
-                ] as const
-              ).map((item) => (
-                <button
-                  key={item.id}
-                  className={tab === item.id ? "active" : ""}
-                  onClick={() => setTab(item.id)}
-                  aria-current={tab === item.id ? "page" : undefined}
-                >
-                  <item.icon size={14} />
-                  {item.name}
-                  {item.id === "activity" && pending.length > 0 && (
-                    <span className="tab-badge">{pending.length}</span>
-                  )}
-                </button>
-              ))}
-            </nav>
-          )}
+          {selected && <><span className={`research-mode ${researchState}`}><i />{researchState === "running" ? "Pair research" : researchState === "paused" ? "Research paused" : "Planning together"}</span>{researchState !== "planning" && <button className="campaign-control icon-button" aria-label={researchState === "running" ? "Pause autoresearch" : "Resume autoresearch"} title={researchState === "running" ? "Pause autoresearch · keep conversing" : "Resume autoresearch"} onClick={() => void control()}>{researchState === "running" ? <CirclePause size={16} /> : <Play size={15} />}</button>}</>}
           <div className="topbar-actions">
+            {selected && <><span className="workspace-budget" title="Model usage / project budget">{money(selected.budget_spent)} <span>/ {money(selected.budget_total)}</span></span><div className="workspace-menu"><button className="icon-button" aria-label="Project resources" aria-expanded={menuOpen} onClick={() => setMenuOpen(!menuOpen)}><ChevronDown size={16} /></button>{menuOpen && <div className="workspace-menu-items">{(["direction", "knowledge", "researchers", "experiments", "activity"] as const).map(item => <button key={item} onClick={() => { setInspection(item); setMenuOpen(false); }}>{item === "direction" ? "Research direction" : item === "knowledge" ? "Shared knowledge" : item[0].toUpperCase() + item.slice(1)}</button>)}</div>}</div></>}
             <button
               className="icon-button theme-toggle"
               title="Toggle dark mode"
@@ -317,6 +285,7 @@ export function Workspace() {
                 <Settings2 size={16} />
               </button>
             )}
+            {selected && <button ref={converseToggle} className={`converse-toggle ${converseOpen ? "active" : ""}`} aria-label="Toggle Converse" aria-expanded={converseOpen} aria-controls="converse-drawer" onClick={() => setConverseOpen(!converseOpen)}><MessageSquare size={15} /><span>Converse</span></button>}
           </div>
         </header>
         {error && (
@@ -367,116 +336,22 @@ export function Workspace() {
             </div>
           </section>
         ) : (
-          <div className="view-shell">
-            {tab === "converse" && (
-              <Conversation
-                key={selected.id}
-                project={selected}
-                data={data}
-                connected={connected}
-                onRefresh={refresh}
-                onSettings={() => openSettings("project", "models")}
-                onError={setError}
-              />
-            )}
-            {tab === "research" && (
-              <>
-                <nav className="subnav" aria-label="Research sections">
-                  {researchTabs.map((item) => (
-                    <button
-                      key={item.id}
-                      className={researchTab === item.id ? "active" : ""}
-                      onClick={() => setResearchTab(item.id)}
-                    >
-                      {item.label}
-                    </button>
-                  ))}
-                  {hasResearch && (
-                    <button
-                      className="research-toggle"
-                      aria-label={
-                        selected.status === "active"
-                          ? "Pause research"
-                          : "Resume research"
-                      }
-                      onClick={() => void control()}
-                    >
-                      {selected.status === "active" ? (
-                        <CirclePause size={14} />
-                      ) : (
-                        <Play size={14} />
-                      )}
-                      <span>
-                        {selected.status === "active"
-                          ? "Pause research"
-                          : "Resume research"}
-                      </span>
-                    </button>
-                  )}
-                </nav>
-                <div className="view-scroll">
-                  {researchTab === "brief" && (
-                    <ResearchBrief project={selected} data={data} />
-                  )}{" "}
-                  {researchTab === "tree" && (
-                    <ResearchTree
-                      records={data.tree}
-                      onChange={refresh}
-                      onError={setError}
-                      onNotice={setNotice}
-                    />
-                  )}{" "}
-                  {researchTab === "knowledge" && (
-                    <Commons
-                      claims={data.claims}
-                      evidence={data.evidence}
-                      artifacts={data.artifacts}
-                    />
-                  )}{" "}
-                  {researchTab === "researchers" && (
-                    <Holarchy
-                      records={data.holarchy}
-                      onChange={refresh}
-                      onError={setError}
-                    />
-                  )}{" "}
-                  {researchTab === "experiments" && (
-                    <Experiments records={data.experiments} />
-                  )}
-                </div>
-              </>
-            )}
-            {tab === "activity" && (
-              <div className="view-scroll">
-                {pending.length > 0 && (
-                  <div className="activity-notices">
-                    {pending.map((item) => (
-                      <div key={item.id}>
-                        <p>
-                          {String(
-                            item.summary || "Review this research update",
-                          )}
-                        </p>
-                        <button onClick={() => setTab("converse")}>
-                          {item.type === "permission"
-                            ? "Review in conversation"
-                            : "Continue in conversation"}{" "}
-                          →
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <Operations
-                  project={selected}
-                  data={data}
-                  onDelete={() => setArchive(true)}
-                />
-              </div>
-            )}
+          <div className={`canopy-workspace ${converseOpen ? "converse-open" : ""}`}>
+            <ResearchCanvas key={selected.id} project={selected} data={data} onDiscuss={discuss} onRefresh={refresh} onError={setError} onKnowledge={() => setInspection("knowledge")} />
+            <aside id="converse-drawer" className="converse-drawer" aria-label="Converse" inert={!converseOpen} aria-hidden={!converseOpen}>
+              <header className="converse-heading"><div><MessageSquare size={15} /><strong>Converse</strong><span>Your research partner</span></div><button className="icon-button" aria-label="Close Converse" onClick={() => { setConverseOpen(false); converseToggle.current?.focus(); }}><X size={16} /></button></header>
+              <Conversation key={selected.id} project={selected} data={data} connected={connected} onRefresh={refresh} onSettings={() => openSettings("project", "models")} onError={setError} reference={reference} onClearReference={() => setReference(null)} visible={converseOpen} />
+            </aside>
           </div>
         )}
       </main>
+      {inspection && selected && <Modal title={inspection === "direction" ? "Research direction" : inspection === "knowledge" ? "Shared knowledge" : inspection[0].toUpperCase() + inspection.slice(1)} onClose={() => setInspection(null)} wide><div className="resource-inspection">
+        {inspection === "direction" && <ResearchBrief project={selected} data={data} />}
+        {inspection === "knowledge" && <Commons claims={data.claims} evidence={data.evidence} artifacts={data.artifacts} />}
+        {inspection === "researchers" && <Holarchy records={data.holarchy} onChange={refresh} onError={setError} />}
+        {inspection === "experiments" && <Experiments records={data.experiments} />}
+        {inspection === "activity" && <Operations project={selected} data={data} onDelete={() => { setInspection(null); setArchive(true); }} />}
+      </div></Modal>}
       {notice && (
         <div className="notice" role="status">
           {notice}

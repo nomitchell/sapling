@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sapling.runtime import (
     HolonContextBuilder,
     HolonDecision,
+    ResearchControl,
     RoutingBatch,
     RuntimeRejected,
     apply_decision,
@@ -101,6 +102,19 @@ def rows(store, kind):
 def event_types(store):
     with store.transaction() as tx:
         return list(tx.conn.execute(select(events.c.type)).scalars())
+
+
+def test_continuous_research_cannot_apply_human_controls(store):
+    result = apply(
+        store,
+        decision(
+            response="Continue the scientific work.",
+            research_control=ResearchControl(action="pause", human_input_id="invented"),
+        ),
+    )
+    assert result["work_order"] is None
+    assert "HUMAN_CONTROLS_IGNORED" in event_types(store)
+    assert get(store, "projects", "p")["status"] == "active"
 
 
 def add_branch(store, nid="b", value=0.8, cost=1):
@@ -246,6 +260,28 @@ async def test_stale_allocation_gets_one_repair_without_executing_work(store):
     assert (await run_turn(store, "h", model, dispatch))["status"] == "retrying"
     assert "node_assessments" in get(store, "holons", "h")["runtime_feedback"]
     assert (await run_turn(store, "h", model, dispatch))["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_invalid_runtime_reference_gets_one_bounded_repair(store):
+    async def model(context, schema, settings):
+        return {
+            "decision": decision(
+                work_orders=[
+                    work(node_id="invented-node")
+                ]
+            ).model_dump(),
+            "cost_usd": 0.001,
+        }
+
+    async def dispatch(*args):
+        pytest.fail("Invalid work must never execute")
+
+    first = await run_turn(store, "h", model, dispatch)
+    assert first["status"] == "retrying"
+    assert "invented-node" in get(store, "holons", "h")["runtime_feedback"]
+    second = await run_turn(store, "h", model, dispatch)
+    assert second["status"] == "rejected"
 
 
 def test_recursive_delegation_conserves_money_and_returns_unused_budget(store):

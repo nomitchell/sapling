@@ -54,6 +54,7 @@ class Worker:
     def __init__(self, store, data_dir, vault):
         self.store, self.data_dir, self.vault = store, data_dir, vault
         self.running = {}
+        self.running_scopes = {}
         self.user_stops = set()
 
     async def stop_holon(self, holon_id):
@@ -63,10 +64,16 @@ class Worker:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    async def stop_scope(self, project_id, scope):
+        for hid, details in list(self.running_scopes.items()):
+            if details == (project_id, scope):
+                await self.stop_holon(hid)
+
     def preflight(self, project):
         settings = project["settings"]
-        if is_placeholder(self.vault.get("openai")):
-            return "Add an OpenAI API key in Settings to start research. Your messages have been saved."
+        provider = settings.get("provider", "openai")
+        if is_placeholder(self.vault.get(provider)):
+            return f"Add a {provider.title()} API key in Settings to start research. Your messages have been saved."
         if not settings.get("model"):
             return "Choose a model identifier in project Settings before starting research."
         if settings.get("input_cost_per_million", 0) <= 0 or settings.get("output_cost_per_million", 0) <= 0:
@@ -74,6 +81,8 @@ class Worker:
         return None
 
     async def serve(self):
+        from .retrieval import semantic_retriever
+        preparation = asyncio.create_task(asyncio.to_thread(semantic_retriever(str(self.data_dir / "retrieval")).prepare, download=True))
         active = set()
         try:
             while True:
@@ -89,6 +98,7 @@ class Worker:
                 else:
                     await asyncio.sleep(0.5)
         finally:
+            preparation.cancel()
             for task in active:
                 task.cancel()
             await asyncio.gather(*active, return_exceptions=True)
@@ -103,7 +113,9 @@ class Worker:
                 {"job_id": job["id"], "holon_id": job["holon_id"], "kind": job["kind"]},
             )
         self.running[job["holon_id"]] = asyncio.current_task()
+        self.running_scopes[job["holon_id"]] = (job["project_id"], job["payload"].get("work_scope", "research"))
         heartbeat = asyncio.create_task(self._heartbeat(job["id"], owner))
+        watcher = asyncio.create_task(self._watch_controls(job, asyncio.current_task()))
         try:
             await self.perform(job)
         except asyncio.CancelledError:
@@ -121,8 +133,12 @@ class Worker:
                     {
                         "project_id": job["project_id"],
                         "holon_id": job["holon_id"],
+                        "node_id": (tx.get("holons", job["holon_id"]) or {}).get("assigned_node_id"),
+                        "work_scope": job["payload"].get("work_scope", "research"),
                         "type": "interrupted_job",
                         "status": "pending",
+                        "read_at": None,
+                        "pauses_subtree": True,
                         "summary": "Application stopped during a research action. Review the latest logs before resuming.",
                         "job_id": job["id"],
                     },
@@ -139,8 +155,12 @@ class Worker:
                     {
                         "project_id": job["project_id"],
                         "holon_id": job["holon_id"],
+                        "node_id": (tx.get("holons", job["holon_id"]) or {}).get("assigned_node_id"),
+                        "work_scope": job["payload"].get("work_scope", "research"),
                         "type": "error",
                         "status": "pending",
+                        "read_at": None,
+                        "pauses_subtree": True,
                         "summary": message,
                         "job_id": job["id"],
                     },
@@ -150,9 +170,11 @@ class Worker:
             self.store.finish(job["id"], owner)
         finally:
             self.running.pop(job["holon_id"], None)
+            self.running_scopes.pop(job["holon_id"], None)
             self.user_stops.discard(job["holon_id"])
             heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+            watcher.cancel()
+            await asyncio.gather(heartbeat, watcher, return_exceptions=True)
             with self.store.transaction() as tx:
                 tx.event(
                     job["project_id"], "JOB_FINISHED", {"job_id": job["id"], "holon_id": job["holon_id"]}
@@ -163,11 +185,34 @@ class Worker:
             await asyncio.sleep(20)
             self.store.heartbeat(job_id, owner)
 
+    async def _watch_controls(self, job, task):
+        from .runtime import conversation_request
+        while not task.done():
+            await asyncio.sleep(0.25)
+            with self.store.transaction() as tx:
+                project = tx.get("projects", job["project_id"])
+                holon = tx.get("holons", job["holon_id"])
+            request = conversation_request(project or {}, job["payload"].get("work_scope", "research"))
+            if not project or not holon or holon.get("terminated") or (request and request.get("state") == "cancelled"):
+                self.user_stops.add(job["holon_id"])
+                task.cancel()
+                return
+
     async def perform(self, job):
+        from .runtime import CURRENT_SCOPE
+        token = CURRENT_SCOPE.set(job["payload"].get("work_scope", "research"))
+        try:
+            return await self._perform_scoped(job)
+        finally:
+            CURRENT_SCOPE.reset(token)
+
+    async def _perform_scoped(self, job):
+        from .runtime import _runnable
         with self.store.transaction() as tx:
             project = tx.get("projects", job["project_id"])
             holon = tx.get("holons", job["holon_id"])
-        if not project or project["status"] != "active" or not holon or holon.get("chat_stopped"):
+            runnable = _runnable(tx, project, holon)
+        if not runnable:
             return
         if job["kind"] == "work_order":
             from .runtime import execute_work_order
@@ -212,12 +257,12 @@ class Worker:
                         project["id"], "ATTENTION_CREATED", {"attention_id": item["id"], "summary": problem}
                     )
             return
-        from .integrations.model import OpenAIModelRuntime, input_token_bound
+        from .integrations.model import model_runtime, input_token_bound
         from .runtime import INSTRUCTIONS, run_turn
 
         settings = project["settings"]
-        model = OpenAIModelRuntime(
-            self.vault.get("openai"),
+        model = model_runtime(
+            settings.get("provider", "openai"), self.vault.get(settings.get("provider", "openai")),
             settings["model"],
             settings["reasoning_effort"],
             settings["input_cost_per_million"],
@@ -255,9 +300,9 @@ class Worker:
             if job["kind"] == "route_evidence":
                 from .runtime import route_evidence
 
-                await route_evidence(self.store, job["payload"]["evidence_id"], call_model)
+                await route_evidence(self.store, job["payload"]["evidence_id"], call_model, cache_dir=self.data_dir / "retrieval")
             else:
-                await run_turn(self.store, holon["id"], call_model, self.dispatch)
+                await run_turn(self.store, holon["id"], call_model, self.dispatch, cache_dir=self.data_dir / "retrieval")
         finally:
             await model.close()
 
@@ -269,10 +314,11 @@ class Worker:
         kind, args = order["kind"], order.get("arguments", {})
         pid = project["id"]
         with self.store.transaction() as tx:
+            from .runtime import _runnable
             latest = tx.get("projects", pid)
             current = tx.get("holons", holon["id"])
             node = tx.get("research_nodes", order["node_id"])
-            if not latest or latest["status"] != "active" or current["status"] != "active":
+            if not _runnable(tx, latest, current):
                 return {
                     "summary": "Work stopped because the project or researcher is paused.",
                     "status": "paused",
@@ -490,12 +536,24 @@ class Worker:
 
     async def experiment(self, order, holon, project):
         from .integrations.execution import LocalDockerBackend, LocalProcessBackend
+        import time
 
         args, pid = order["arguments"], project["id"]
         command = args.get("command")
         if not isinstance(command, list) or not command or not all(isinstance(x, str) for x in command):
             raise ValueError("Experiment command must be a nonempty argument list")
         with self.store.transaction() as tx:
+            parent_id = args.get("parent_experiment_id")
+            parent_commit = args.get("parent_commit")
+            if parent_id:
+                parent = tx.get("experiments", parent_id)
+                if not parent or parent.get("project_id") != pid:
+                    raise ValueError("Parent experiment must belong to this project")
+                if args.get("source_dir"):
+                    raise ValueError("Choose a recorded parent snapshot or an imported directory")
+                parent_commit = parent_commit or parent.get("result", {}).get("git_commit")
+                if not parent_commit:
+                    raise ValueError("Parent experiment has no recorded input snapshot")
             experiment = tx.create(
                 "experiments",
                 {
@@ -508,6 +566,8 @@ class Worker:
                         "prediction": args.get("prediction", ""),
                         "seed": args.get("seed", 0),
                         "command": command,
+                        "parent_experiment_id": parent_id,
+                        "parent_commit": parent_commit,
                         "dataset_version": args.get("dataset_version", "unspecified"),
                         "evaluator_version": args.get("evaluator_version", "unspecified"),
                         "environment_version": "python:3.12-slim"
@@ -528,8 +588,10 @@ class Worker:
                 else {}
             )
             backend = backend_type(self.data_dir / "workspaces", **options)
-            workspace = await backend.create_workspace(
-                pid, experiment["id"], source_dir=args.get("source_dir")
+            workspace = (
+                await backend.fork_workspace(pid, experiment["id"], parent_id, parent_commit)
+                if parent_id else await backend.create_workspace(
+                    pid, experiment["id"], source_dir=args.get("source_dir"))
             )
             base = Path(workspace.path).resolve()
             files = args.get("files", {})
@@ -551,6 +613,7 @@ class Worker:
                 int(args.get("timeout_seconds", project["settings"]["experiment_timeout"])),
                 project["settings"]["experiment_timeout"],
             )
+            deadline = time.monotonic() + max(1, timeout)
             with self.store.transaction() as tx:
                 tx.update(
                     "experiments",
@@ -566,7 +629,9 @@ class Worker:
                     await asyncio.wait({task}, timeout=0.5)
                     with self.store.transaction() as tx:
                         p, h = tx.get("projects", pid), tx.get("holons", holon["id"])
-                    if p["status"] != "active" or h["status"] == "paused":
+                    from .runtime import conversation_request
+                    request = conversation_request(p or {})
+                    if not p or not h or p["status"] == "archived" or h.get("terminated") or (request and request.get("state") == "cancelled"):
                         await backend.cancel(experiment["id"])
                 result = await task
             except BaseException:
@@ -575,6 +640,27 @@ class Worker:
                 await asyncio.gather(task, return_exceptions=True)
                 raise
             payload = serialize(result)
+            payload.update(parent_experiment_id=parent_id, parent_commit=parent_commit)
+            manifest_path = Path(payload.get("manifest_path", ""))
+            manifest_artifact = None
+            if manifest_path.is_file() and manifest_path.resolve().is_relative_to(workspace.metadata_path.resolve()):
+                manifest_artifact = save_artifact(
+                    self.store, self.data_dir, pid, manifest_path.read_bytes(), "run-manifest.json",
+                    "experiment_manifest", {"experiment_id": experiment["id"]})
+            evaluation = args.get("evaluation")
+            if evaluation and payload.get("exit_code") == 0 and not payload.get("cancelled") and not payload.get("timed_out"):
+                if not isinstance(evaluation, dict):
+                    raise ValueError("Evaluation must provide files and an executable command")
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    # Evaluation belongs to the same approved bounded work order.
+                    # It shares that order's deadline and cancellation task.
+                    payload["evaluation"] = await backend.evaluate(
+                        workspace, evaluation.get("files", {}), evaluation.get("command", []),
+                        timeout_seconds=remaining, config=evaluation.get("config"),
+                        expected_version=evaluation.get("version"))
+                else:
+                    payload["evaluation"] = {"verification": "not_run", "reason": "work_order_time_budget_exhausted"}
             log_artifact = save_artifact(
                 self.store,
                 self.data_dir,
@@ -585,6 +671,14 @@ class Worker:
                 {"experiment_id": experiment["id"]},
             )
             artifacts = [source["id"], log_artifact["id"]]
+            if manifest_artifact:
+                artifacts.append(manifest_artifact["id"])
+            if payload.get("evaluation"):
+                evaluation_artifact = save_artifact(
+                    self.store, self.data_dir, pid,
+                    json.dumps(payload["evaluation"], ensure_ascii=False, default=str).encode(),
+                    "evaluation.json", "evaluation_result", {"experiment_id": experiment["id"]})
+                artifacts.append(evaluation_artifact["id"])
             collected = await backend.collect_artifacts(workspace)
             for entry in collected[:50]:
                 info = serialize(entry)
@@ -636,6 +730,10 @@ class Worker:
                             "exit_code": exit_code,
                             "seed": args.get("seed", 0),
                             "metrics_are_untrusted": True,
+                            "evaluation_version": payload.get("evaluation", {}).get("evaluator_version"),
+                            "verification": payload.get("evaluation", {}).get("verification", "reported_output"),
+                            "parent_experiment_id": parent_id,
+                            "parent_commit": parent_commit,
                             "status": status,
                             "timed_out": payload.get("timed_out", False),
                             "cancelled": payload.get("cancelled", False),

@@ -231,6 +231,15 @@ class Tx:
         ).scalar_one_or_none()
         return dict(row) if row is not None else None
 
+    def delete_project(self, project_id: str):
+        """Purge one project's records after its workers have stopped."""
+        for kind, table in tables.items():
+            if kind != "projects":
+                self.conn.execute(table.delete().where(table.c.project_id == project_id))
+        self.conn.execute(jobs.delete().where(jobs.c.project_id == project_id))
+        self.conn.execute(events.delete().where(events.c.project_id == project_id))
+        self.conn.execute(tables["projects"].delete().where(tables["projects"].c.id == project_id))
+
     def list(self, kind: str, project_id: str | None = None, **filters) -> list[dict]:
         table = tables[kind]
         query = select(table.c.data).order_by(table.c.created_at, table.c.id)

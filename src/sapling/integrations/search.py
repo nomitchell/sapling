@@ -55,6 +55,7 @@ class SourceArtifact:
     text_path: str
     metadata_path: str
     text: str
+    links: list[dict[str, str]] = field(default_factory=list)
 
 
 async def _resolve(hostname: str, port: int) -> list[str]:
@@ -126,6 +127,7 @@ class SearchClient:
         searxng_url: str | None = None,
         openalex_api_key: str | None = None,
         *,
+        tavily_api_key: str | None = None,
         client: httpx.AsyncClient | None = None,
         timeout_seconds: float = 30,
         max_source_bytes: int = 20_000_000,
@@ -135,6 +137,7 @@ class SearchClient:
     ) -> None:
         self.searxng_url = searxng_url.rstrip("/") if searxng_url else None
         self.openalex_api_key = openalex_api_key
+        self.tavily_api_key = tavily_api_key
         self.timeout_seconds = timeout_seconds
         self.max_source_bytes = max_source_bytes
         self.resolver = resolver
@@ -161,11 +164,12 @@ class SearchClient:
         return query, max(1, min(int(limit), 30))
 
     async def _json(self, url: str, **kwargs: object) -> dict:
+        method = kwargs.pop("method", "GET")
         try:
             async with asyncio.timeout(self.timeout_seconds):
-                async with self.client.stream("GET", url, follow_redirects=False, **kwargs) as response:
+                async with self.client.stream(method, url, follow_redirects=False, **kwargs) as response:
                     if response.status_code in {401, 403}:
-                        raise SearchUnavailable("Search authorization failed. For OpenAlex, add a free API key; for SearXNG, enable JSON in search.formats.")
+                        raise SearchUnavailable("Search authorization failed. Check the provider key in Connections; for SearXNG, enable JSON in search.formats.")
                     if response.status_code == 429:
                         raise SearchUnavailable("The search provider rate limit was reached. Retry later or configure an API key.")
                     response.raise_for_status()
@@ -201,6 +205,17 @@ class SearchClient:
 
     async def search_web(self, query: str, limit: int = 8) -> list[SearchResult]:
         query, limit = self._query(query, limit)
+        if self.tavily_api_key:
+            payload = await self._json(
+                "https://api.tavily.com/search", method="POST",
+                headers={"Authorization": f"Bearer {self.tavily_api_key}"},
+                json={"query": query, "max_results": min(limit, 20), "search_depth": "basic",
+                      "include_answer": False, "include_raw_content": False},
+            )
+            return [SearchResult(
+                title=item.get("title", "Untitled result"), url=item["url"],
+                summary=item.get("content", ""), provider="tavily",
+            ) for item in payload.get("results", [])[:limit] if item.get("url")]
         failure = "SearXNG is not configured."
         if self.searxng_url:
             try:
@@ -267,6 +282,19 @@ class SearchClient:
                 raise SourceRejected("The source redirect limit was exceeded.")
         raw = bytes(data)
         title, text = await asyncio.to_thread(extract_text, raw, content_type)
+        links = []
+        if content_type in {"text/html", "application/xhtml+xml"}:
+            soup = BeautifulSoup(raw, "html.parser")
+            seen = set()
+            for anchor in soup.select("a[href]"):
+                href = urljoin(current, anchor.get("href", ""))
+                label = anchor.get_text(" ", strip=True)
+                if (urlsplit(href).scheme in {"http", "https"} and href not in seen
+                    and any(word in (label + " " + href).lower() for word in ("pdf", "html", "supplement", "full text", "code", "github"))):
+                    links.append({"title": label[:160], "url": href})
+                    seen.add(href)
+                    if len(links) == 20:
+                        break
         digest = hashlib.sha256(raw).hexdigest()
         destination = Path(destination_dir).resolve()
         destination.mkdir(parents=True, exist_ok=True)
@@ -274,7 +302,7 @@ class SearchClient:
         raw_path = destination / f"{digest}.source"
         text_path = destination / f"{digest}.txt"
         metadata_path = destination / f"{source_id}.json"
-        record = SourceArtifact(source_id, requested_url, current, title, content_type, datetime.now(timezone.utc).isoformat(), digest, len(raw), str(raw_path), str(text_path), str(metadata_path), text)
+        record = SourceArtifact(source_id, requested_url, current, title, content_type, datetime.now(timezone.utc).isoformat(), digest, len(raw), str(raw_path), str(text_path), str(metadata_path), text, links)
         raw_path.write_bytes(raw)
         text_path.write_text(text, encoding="utf-8")
         metadata = asdict(record)

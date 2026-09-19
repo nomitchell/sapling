@@ -94,13 +94,15 @@ class Worker:
             await asyncio.gather(*active, return_exceptions=True)
 
     async def _perform_leased(self, job, owner):
-        self.running[job["holon_id"]] = asyncio.current_task()
         with self.store.transaction() as tx:
+            if not tx.get("projects", job["project_id"]):
+                return
             tx.event(
                 job["project_id"],
                 "JOB_STARTED",
                 {"job_id": job["id"], "holon_id": job["holon_id"], "kind": job["kind"]},
             )
+        self.running[job["holon_id"]] = asyncio.current_task()
         heartbeat = asyncio.create_task(self._heartbeat(job["id"], owner))
         try:
             await self.perform(job)
@@ -261,7 +263,7 @@ class Worker:
 
     async def dispatch(self, order, holon, project, *, approval_id=None):
         from .integrations.permissions import PermissionPolicy
-        from .integrations.search import SearchClient
+        from .integrations.search import SearchClient, extract_text
 
         order = serialize(order)
         kind, args = order["kind"], order.get("arguments", {})
@@ -355,7 +357,8 @@ class Worker:
 
         if kind in {"search_literature", "search_web", "open_source"}:
             async with SearchClient(
-                os.environ.get("SAPLING_SEARXNG_URL", "http://127.0.0.1:8088"), self.vault.get("openalex")
+                os.environ.get("SAPLING_SEARXNG_URL", "http://127.0.0.1:8088"), self.vault.get("openalex"),
+                tavily_api_key=self.vault.get("tavily"),
             ) as search:
                 if kind == "open_source":
                     source = await search.fetch_source(args["url"], self.data_dir / "downloads")
@@ -380,7 +383,13 @@ class Worker:
                         {"source_artifact_id": raw["id"]},
                     )
                     return {
-                        "summary": f"Opened {source.final_url}\n{source.text[:12000]}",
+                        "summary": f"Opened {source.final_url}\n{source.text[:2600]}",
+                        "artifact_id": txt["id"],
+                        "raw_artifact_id": raw["id"],
+                        "links": source.links,
+                        "total_characters": len(source.text),
+                        "next_offset": 2600 if len(source.text) > 2600 else None,
+                        "reading_hint": "This is an excerpt. Read artifact_id with query for a section or next_offset for the next passage. An abstract page is not the full paper; open its PDF/HTML link.",
                         "cost_usd": 0,
                         "evidence": [
                             {
@@ -412,6 +421,7 @@ class Worker:
                             "abstract": r.summary[:300],
                             "year": r.year,
                             "open_access_url": r.open_access_url,
+                            "provider": r.provider,
                         }
                         for r in results
                     ],
@@ -444,8 +454,38 @@ class Worker:
             content = path.read_bytes()
             if hashlib.sha256(content).hexdigest() != item["sha256"]:
                 raise ValueError("Artifact integrity check failed")
+            content_type = item.get("metadata", {}).get("content_type", "")
+            if content.startswith(b"%PDF"):
+                content_type = "application/pdf"
+            elif content.lstrip()[:40].lower().startswith((b"<!doctype html", b"<html")):
+                content_type = "text/html"
+            if content_type in {"text/html", "application/xhtml+xml", "application/pdf"}:
+                _, text = await asyncio.to_thread(extract_text, content, content_type)
+            else:
+                text = content.decode(errors="replace")
             offset = max(0, int(args.get("offset", 0)))
-            return {"summary": content.decode(errors="replace")[offset : offset + 20000], "cost_usd": 0}
+            query = str(args.get("query") or "").strip()
+            if query:
+                folded = text.lower()
+                match = folded.find(query.lower(), offset)
+                if match < 0:
+                    return {"summary": f"Phrase {query!r} was not found at or after offset {offset}. Try a shorter phrase or page through with offset.",
+                            "artifact_id": item["id"], "total_characters": len(text), "cost_usd": 0}
+                passages = []
+                first_offset = max(offset, match - 100)
+                end = offset
+                while match >= 0 and len(passages) < 6:
+                    start = max(offset, match - 100)
+                    end = min(len(text), match + 300)
+                    passages.append(f"[Characters {start}-{end}]\n{text[start:end]}")
+                    match = folded.find(query.lower(), max(end, match + len(query)))
+                return {"summary": "\n\n".join(passages), "artifact_id": item["id"],
+                        "offset": first_offset, "next_offset": end if end < len(text) else None,
+                        "total_characters": len(text), "cost_usd": 0}
+            end = min(len(text), offset + 2600)
+            return {"summary": text[offset:end], "artifact_id": item["id"],
+                    "offset": offset, "next_offset": end if end < len(text) else None,
+                    "total_characters": len(text), "cost_usd": 0}
         return await self.experiment(order, holon, project)
 
     async def experiment(self, order, holon, project):

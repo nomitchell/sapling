@@ -156,6 +156,62 @@ def test_full_decision_wire_schema_is_closed_and_maps_round_trip():
     assert decision.work_orders[0].arguments["query"] == "robustness diffusion"
 
 
+def test_progress_is_distinct_from_substantive_answer_and_legacy_is_preserved(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Find evidence"})
+    with store.transaction() as tx:
+        h = tx.get("holons", p["root_holon_id"])
+        project = tx.get("projects", p["id"])
+        apply_decision(tx, project, h, HolonDecision(
+            updated_summary="Checking evidence", progress_note="Checking the paper's ablation tables.",
+            response="The evidence supports a narrower claim.",
+        ), HolonContextBuilder().build(tx, h, project))
+        legacy = tx.create("messages", {"project_id": p["id"], "role": "assistant", "text": "I will search now."})
+        tx.create("decision_snapshots", {"project_id": p["id"], "holon_id": h["id"],
+            "decision": {"response": legacy["text"], "work_orders": [{"kind": "search_web"}]}})
+    messages = client.get(f"/projects/{p['id']}/messages").json()
+    assert [m.get("channel") for m in messages[-3:]] == ["progress", "answer", "progress"]
+    with store.transaction() as tx:
+        assert "channel" not in tx.get("messages", legacy["id"])
+
+
+def test_permanent_project_delete_preserves_other_project_and_settings(workspace):
+    client, store, p, _ = workspace
+    other = client.post("/projects", json={"title": "Keep me"}).json()
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Saved research"})
+    assert client.delete(f"/projects/{p['id']}?permanent=true").json() == {"deleted": True}
+    assert client.get(f"/projects/{p['id']}/messages").status_code == 404
+    assert client.get(f"/projects/{other['id']}/messages").status_code == 200
+    with store.transaction() as tx:
+        assert tx.get("projects", p["id"]) is None
+        assert tx.list("messages", p["id"]) == []
+        assert tx.list("holons", p["id"]) == []
+        assert tx.jobs(p["id"]) == []
+        assert tx.history(p["id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_progress_only_turn_recovers_once_then_reports_error(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Read a paper"})
+    contexts = []
+    async def model(context, schema, settings):
+        contexts.append(context)
+        return {"decision": HolonDecision(updated_summary="Reading", progress_note="A read is queued.").model_dump(), "cost_usd": 0.001}
+    await run_turn(store, p["root_holon_id"], model, None)
+    with store.transaction() as tx:
+        assert tx.get("holons", p["root_holon_id"])["empty_turn_count"] == 1
+        assert tx.get("holons", p["root_holon_id"])["status"] == "active"
+    await run_turn(store, p["root_holon_id"], model, None)
+    assert "Nothing is queued" in contexts[-1]["runtime_feedback"]
+    with store.transaction() as tx:
+        assert tx.get("holons", p["root_holon_id"])["status"] == "blocked"
+        assert tx.list("attention_items", p["id"])[-1]["type"] == "error"
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Try again"})
+    with store.transaction() as tx:
+        assert tx.get("holons", p["root_holon_id"])["empty_turn_count"] == 0
+
+
 @pytest.mark.asyncio
 async def test_worker_stop_cancels_model_without_interrupt_attention(workspace, tmp_path):
     client, store, p, app = workspace
@@ -240,6 +296,20 @@ async def test_new_tool_results_survive_context_limits(workspace):
         context = HolonContextBuilder().build(tx, h, p)
         assert h["recent_tool_results"][-1]["summary"].startswith("RESULT-6")
         assert context["recent_tool_results"][-1]["summary"].startswith("RESULT-6")
+
+
+def test_source_catalog_keeps_exact_citations_after_tool_history_rolls_off(workspace):
+    _, store, p, _ = workspace
+    with store.transaction() as tx:
+        source = tx.create("artifacts", {"project_id": p["id"], "type": "source", "metadata": {
+            "title": "Better Diffusion Models Further Improve Adversarial Training",
+            "final_url": "https://proceedings.mlr.press/v202/wang23ad/wang23ad.pdf"}})
+        extracted = tx.create("artifacts", {"project_id": p["id"], "type": "extracted_text",
+            "metadata": {"source_artifact_id": source["id"]}})
+        h = tx.get("holons", p["root_holon_id"])
+        context = HolonContextBuilder().build(tx, h, p)
+    assert context["sources"] == [{"title": source["metadata"]["title"],
+                                  "url": source["metadata"]["final_url"], "artifact_id": extracted["id"]}]
 
 
 @pytest.mark.asyncio

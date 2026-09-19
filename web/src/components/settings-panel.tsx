@@ -234,6 +234,7 @@ export function SettingsPanel({
   globalSettings,
   onClose,
   onSaved,
+  onDelete,
   theme,
   onTheme,
   initialSection = "general",
@@ -242,6 +243,7 @@ export function SettingsPanel({
   globalSettings: ResearchSettings;
   onClose: () => void;
   onSaved: () => void;
+  onDelete?: () => void;
   theme: Theme;
   onTheme: (theme: Theme) => void;
   initialSection?: Section;
@@ -370,6 +372,14 @@ export function SettingsPanel({
               </Row>
             </>
           )}
+          {section === "general" && project && onDelete && (
+            <div className="setting-row">
+              <span>Delete project</span>
+              <button className="button secondary" onClick={onDelete}>
+                Delete project…
+              </button>
+            </div>
+          )}
           {section === "models" && (
             <ModelFields value={config} onChange={setConfig} />
           )}
@@ -394,9 +404,9 @@ export function SettingsPanel({
                   <option value="docker">Docker container</option>
                 </select>
               </Row>
-              <Row name="Parallel researchers">
+              <Row name="Maximum simultaneous researchers">
                 <input
-                  aria-label="Parallel researchers"
+                  aria-label="Maximum simultaneous researchers"
                   type="number"
                   min="1"
                   max="32"
@@ -486,7 +496,7 @@ function Connections() {
   useEffect(load, []);
   return (
     <>
-      {["openai", "openalex"].map((provider) => (
+      {["openai", "openalex", "tavily"].map((provider) => (
         <Connection
           key={provider}
           provider={provider}
@@ -536,7 +546,13 @@ function Connection({
     <>
       <div className="connection-row">
         <div>
-          <strong>{provider === "openai" ? "OpenAI" : "OpenAlex"}</strong>
+          <strong>
+            {provider === "openai"
+              ? "OpenAI"
+              : provider === "tavily"
+                ? "Tavily"
+                : "OpenAlex"}
+          </strong>
           <small>
             {loading
               ? "Checking…"

@@ -185,7 +185,7 @@ class LocalProcessBackend:
     async def _git(self, workspace: Workspace, *arguments: str, check: bool = True) -> str:
         if not shutil.which("git"):
             raise ExecutionUnavailable("Git must be installed to record reproducible experiment snapshots.")
-        process = await asyncio.create_subprocess_exec("git", f"--git-dir={workspace.metadata_path / 'repository.git'}", f"--work-tree={workspace.path}", "-c", "core.hooksPath=", "-c", "commit.gpgsign=false", *arguments, cwd=workspace.path, env=sanitized_environment(workspace.path), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec("git", f"--git-dir={workspace.metadata_path / 'repository.git'}", f"--work-tree={workspace.path}", "-c", "core.longpaths=true", "-c", "core.hooksPath=", "-c", "commit.gpgsign=false", *arguments, cwd=workspace.path, env=sanitized_environment(workspace.path), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
         except BaseException:

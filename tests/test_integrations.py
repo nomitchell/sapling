@@ -8,12 +8,30 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+
+
 from pydantic import BaseModel
 
 from sapling.integrations.execution import LocalDockerBackend, LocalProcessBackend, WorkspaceViolation, contained_path, sanitized_environment
 from sapling.integrations.model import MissingCredential, ModelResponseError, OpenAIModelRuntime
 from sapling.integrations.permissions import PermissionPolicy
 from sapling.integrations.search import SearchClient, SearchUnavailable, SourceRejected, validate_public_url
+
+
+@pytest.mark.asyncio
+async def test_tavily_is_preferred_and_credentials_stay_on_provider():
+    requests = []
+    def handler(request):
+        requests.append(request)
+        assert request.url == "https://api.tavily.com/search"
+        assert request.method == "POST"
+        assert request.headers["Authorization"] == "Bearer test-tavily-key"
+        return httpx.Response(200, json={"results": [{"title": "Primary study", "url": "https://example.org/paper", "content": "Experiments"}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with SearchClient("http://unused.local", tavily_api_key="test-tavily-key", client=client) as search:
+            results = await search.search_web("robustness")
+    assert len(requests) == 1
+    assert results[0].provider == "tavily" and results[0].summary == "Experiments"
 
 
 def test_permission_modes_and_scoped_grants():

@@ -703,7 +703,7 @@ export function Operations({
         </div>
         <button className="button danger-quiet" onClick={onDelete}>
           <Trash2 size={15} />
-          Archive project
+          Delete project
         </button>
       </div>
     </section>

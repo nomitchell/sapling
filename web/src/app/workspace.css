@@ -1773,6 +1773,15 @@ pre {
 .turn-activity small {
   overflow-wrap: anywhere;
 }
+.turn-activity summary span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.turn-activity .activity-note {
+  color: var(--muted);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
 .jump-to-latest {
   display: flex;
   align-items: center;
@@ -1891,4 +1900,14 @@ pre {
   overflow: visible;
   max-width: none;
 }
-:root,[data-theme]{--serif:var(--heading)}::-webkit-scrollbar-thumb{background:var(--border)}::selection{background:var(--soft);color:var(--ink)}
+:root,
+[data-theme] {
+  --serif: var(--heading);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+}
+::selection {
+  background: var(--soft);
+  color: var(--ink);
+}

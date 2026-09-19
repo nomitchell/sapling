@@ -174,6 +174,25 @@ async def test_artifact_cross_project_access_denied_even_with_full_autonomy(work
 
 
 @pytest.mark.asyncio
+async def test_raw_html_artifact_reads_text_and_can_find_later_passages(worker_app):
+    _, store, worker, directory = worker_app
+    project, holon = create_project(worker_app, mode="yolo")
+    html = ("<html><script>invisible script</script><body><p>" + "Introduction. " * 600
+            + "</p><h2>Ablation results</h2><p>The matched control scored 42.</p></body></html>")
+    artifact = save_artifact(store, directory, project["id"], html.encode(), "paper.html", "source",
+                             {"content_type": "text/html"})
+    order = {"node_id": holon["assigned_node_id"], "kind": "read_artifact",
+             "arguments": {"artifact_id": artifact["id"]}, "rationale": "Read paper", "estimated_cost": 0}
+    first = await worker.dispatch(order, holon, project)
+    assert "<html>" not in first["summary"] and "invisible script" not in first["summary"]
+    assert first["next_offset"] == 2600 and first["total_characters"] > 7000
+    order["arguments"]["query"] = "Ablation results"
+    found = await worker.dispatch(order, holon, project)
+    assert "matched control scored 42" in found["summary"]
+    assert found["offset"] > 6000 and found["next_offset"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(not shutil.which("git"), reason="Git required for real execution")
 async def test_experiment_timeout_is_recorded_as_timeout_evidence(worker_app):
     _, store, worker, _ = worker_app

@@ -29,13 +29,24 @@ export type Project = {
   settings: ResearchSettings; budget_total: number; budget_spent: number;
   root_holon_id?: string; created_at: string;
 };
-export type Message = { id: string; role: string; text: string; created_at: string };
+export type Message = { id: string; role: string; text: string; created_at: string; channel?: "answer" | "progress" };
 export type ProjectData = { messages: Message[]; tree: RecordItem[]; holarchy: RecordItem[]; claims: RecordItem[]; evidence: RecordItem[]; experiments: RecordItem[]; attention: RecordItem[]; events: ResearchEvent[]; stats: Stats; artifacts: RecordItem[] };
 export const emptyData: ProjectData = { messages: [], tree: [], holarchy: [], claims: [], evidence: [], experiments: [], attention: [], events: [], stats: {}, artifacts: [] };
 export type RecordItem = Record<string, unknown> & { id: string; title?: string; status?: string; created_at?: string };
 export type ResearchEvent = { id: string; type: string; payload: Record<string, unknown>; created_at: string };
 export type Stats = Record<string, unknown>;
 export type Credential = { provider: string; configured?: boolean; present?: boolean; masked_key?: string; source?: string };
+
+export async function loadEvents(projectId: string): Promise<ResearchEvent[]> {
+  const events: ResearchEvent[] = [];
+  let after = "0";
+  while (true) {
+    const batch = await api<ResearchEvent[]>(`/projects/${projectId}/events?after=${after}`);
+    events.push(...batch);
+    if (batch.length < 250) return events;
+    after = batch[batch.length - 1].id;
+  }
+}
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, {

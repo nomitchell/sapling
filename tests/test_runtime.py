@@ -181,6 +181,19 @@ def test_priority_formula_exploration_cost_and_widening():
         branch_priority(1, 0, 0, float("nan"))
 
 
+def test_same_node_actions_preserve_model_order_and_avoid_repeated_reads(store):
+    with store.transaction() as tx:
+        tx.create("artifacts", {"id": "paper", "project_id": "p"})
+    read = work(kind="read_artifact", arguments={"artifact_id": "paper"})
+    search = work(kind="search_web", arguments={"query": "diffusion robustness"})
+    assert apply(store, decision(work_orders=[search, read]))["work_order"]["kind"] == "search_web"
+    with store.transaction() as tx:
+        tx.update("holons", "h", {"recent_tool_results": [
+            {"kind": "read_artifact", "arguments": {"artifact_id": "paper"}}
+        ]})
+    assert apply(store, decision(work_orders=[read, search]))["work_order"]["kind"] == "search_web"
+
+
 def test_scheduler_selects_priority_and_saves_distillation_snapshot(store):
     add_branch(store, "costly", value=1, cost=100)
     add_branch(store, "useful", value=0.8, cost=1)
@@ -220,6 +233,19 @@ def test_stale_values_require_reassessment_before_allocation(store):
     )
     assert applied["work_order"]["node_id"] == "n"
     assert get(store, "research_nodes", "n")["evidence_epoch"] == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_allocation_gets_one_repair_without_executing_work(store):
+    with store.transaction() as tx:
+        tx.update("projects", "p", {"evidence_epoch": 2})
+    async def model(context, schema, settings):
+        return {"decision": decision(work_orders=[work()]).model_dump(), "cost_usd": 0.001}
+    async def dispatch(*args):
+        pytest.fail("Invalid work must never execute")
+    assert (await run_turn(store, "h", model, dispatch))["status"] == "retrying"
+    assert "node_assessments" in get(store, "holons", "h")["runtime_feedback"]
+    assert (await run_turn(store, "h", model, dispatch))["status"] == "rejected"
 
 
 def test_recursive_delegation_conserves_money_and_returns_unused_budget(store):

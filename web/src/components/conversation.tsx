@@ -6,6 +6,7 @@ import {
   errorText,
   field,
   label,
+  Message,
   Project,
   ProjectData,
   RecordItem,
@@ -95,6 +96,7 @@ export function Conversation({
       ].includes(event.type),
     );
   const tools = turnEvents.filter((event) => event.type === "TOOL_STARTED");
+  const timeline = conversationTimeline(data, project.root_holon_id);
   const started =
     turnEvents.find((event) => event.type === "JOB_STARTED")?.created_at ||
     lastInput?.created_at;
@@ -229,45 +231,55 @@ export function Conversation({
               </p>
             </div>
           )}
-          {data.messages.map((message) => (
-            <article
-              key={message.id}
-              className={`chat-message ${message.role}`}
-            >
-              <header>
-                {message.role === "assistant" && <Sparkles size={15} />}
-                <strong>
-                  {message.role === "assistant"
-                    ? "Sapling"
-                    : message.role === "user"
-                      ? "You"
-                      : label(message.role)}
-                </strong>
-                <time>{date(message.created_at)}</time>
-              </header>
-              <Markdown>{message.text}</Markdown>
-            </article>
-          ))}
-          {tools.length > 0 && (
-            <details className="turn-activity">
-              <summary>
-                {tools.length} research{" "}
-                {tools.length === 1 ? "action" : "actions"}
-              </summary>
-              {tools.map((event) => (
-                <div key={event.id}>
-                  <span>{toolLabel(event)}</span>
-                  <small>
-                    {String(
-                      event.payload.query ||
-                        event.payload.url ||
-                        event.payload.summary ||
-                        "",
-                    )}
-                  </small>
-                </div>
-              ))}
-            </details>
+          {timeline.map((entry) =>
+            entry.kind === "activity" ? (
+              <details className="turn-activity" key={entry.id}>
+                <summary>
+                  Thinking & actions <span>· {entry.items.length}</span>
+                </summary>
+                {entry.items.map((item) =>
+                  item.kind === "note" ? (
+                    <div
+                      className="activity-note"
+                      key={item.id}
+                      title={item.text}
+                    >
+                      {compactNote(item.text)}
+                    </div>
+                  ) : (
+                    <div key={item.id}>
+                      <span>{toolLabel(item.event)}</span>
+                      <small>
+                        {String(
+                          item.event.payload.query ||
+                            item.event.payload.url ||
+                            item.event.payload.summary ||
+                            "",
+                        )}
+                      </small>
+                    </div>
+                  ),
+                )}
+              </details>
+            ) : (
+              <article
+                key={entry.id}
+                className={`chat-message ${entry.message.role}`}
+              >
+                <header>
+                  {entry.message.role === "assistant" && <Sparkles size={15} />}
+                  <strong>
+                    {entry.message.role === "assistant"
+                      ? "Sapling"
+                      : entry.message.role === "user"
+                        ? "You"
+                        : label(entry.message.role)}
+                  </strong>
+                  <time>{date(entry.message.created_at)}</time>
+                </header>
+                <Markdown>{entry.message.text}</Markdown>
+              </article>
+            ),
           )}
           {data.attention
             .filter(
@@ -477,6 +489,75 @@ export function Conversation({
       </div>
     </section>
   );
+}
+
+type ActivityItem =
+  | { kind: "note"; id: string; text: string; created_at: string }
+  | { kind: "tool"; id: string; event: ResearchEvent; created_at: string };
+type TimelineEntry =
+  | { kind: "message"; id: string; message: Message }
+  | { kind: "activity"; id: string; items: ActivityItem[] };
+
+function conversationTimeline(
+  data: ProjectData,
+  rootId?: string,
+): TimelineEntry[] {
+  const entries: (
+    | ActivityItem
+    | { kind: "message"; id: string; message: Message; created_at: string }
+  )[] = [
+    ...data.messages.map((message) =>
+      message.channel === "progress"
+        ? {
+            kind: "note" as const,
+            id: message.id,
+            text: message.text,
+            created_at: message.created_at,
+          }
+        : {
+            kind: "message" as const,
+            id: message.id,
+            message,
+            created_at: message.created_at,
+          },
+    ),
+    ...data.events
+      .filter(
+        (event) =>
+          event.type === "TOOL_STARTED" && event.payload.holon_id === rootId,
+      )
+      .map((event) => ({
+        kind: "tool" as const,
+        id: `tool-${event.id}`,
+        event,
+        created_at: event.created_at,
+      })),
+  ];
+  // ISO timestamps retain microseconds; Date would round same-millisecond steps.
+  entries.sort((a, b) => a.created_at.localeCompare(b.created_at));
+  const result: TimelineEntry[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "message") result.push(entry);
+    else {
+      const previous = result.at(-1);
+      if (previous?.kind === "activity") previous.items.push(entry);
+      else
+        result.push({
+          kind: "activity",
+          id: `activity-${entry.id}`,
+          items: [entry],
+        });
+    }
+  }
+  return result;
+}
+
+function compactNote(text: string) {
+  const plain = text.replace(/\s+/g, " ").trim();
+  const firstSentence = plain.match(/^.*?[.!?](?=\s|$)/)?.[0] || plain;
+  return firstSentence.length > 180
+    ? `${firstSentence.slice(0, 177).trimEnd()}…`
+    : firstSentence;
 }
 
 function toolLabel(event: ResearchEvent) {

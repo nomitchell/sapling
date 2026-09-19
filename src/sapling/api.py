@@ -39,7 +39,7 @@ class MessageInput(Input):
 
 
 class CredentialInput(Input):
-    provider: Literal["openai", "openalex"]
+    provider: Literal["openai", "openalex", "tavily"]
     key: str = Field(min_length=5, max_length=1000)
 
 
@@ -175,7 +175,7 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
     def credentials():
         return [
             {"id": provider, "provider": provider, "configured": bool(vault.get(provider))}
-            for provider in ("openai", "openalex")
+            for provider in ("openai", "openalex", "tavily")
         ]
 
     @app.post("/credentials")
@@ -191,7 +191,7 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
         return {"id": body.provider, "provider": body.provider, "configured": True}
 
     @app.delete("/credentials/{provider}")
-    def delete_credential(provider: Literal["openai", "openalex"]):
+    def delete_credential(provider: Literal["openai", "openalex", "tavily"]):
         vault.delete(provider)
         return {"configured": bool(vault.get(provider)), "environment_fallback": bool(vault.get(provider))}
 
@@ -304,13 +304,23 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
             return project
 
     @app.delete("/projects/{pid}")
-    def archive_project(pid: str):
+    async def archive_project(pid: str, permanent: bool = False):
         with store.transaction() as tx:
             project = require(tx, "projects", pid)
             tx.update(
                 "projects", pid, {"status": "archived", "control_epoch": project.get("control_epoch", 0) + 1}
             )
             tx.event(pid, "PROJECT_ARCHIVED", {})
+            holon_ids = [h["id"] for h in tx.list("holons", pid)]
+            for hid in holon_ids:
+                tx.cancel_queued(hid)
+        worker = getattr(app.state, "worker", None)
+        if worker:
+            await asyncio.gather(*(worker.stop_holon(hid) for hid in holon_ids))
+        if permanent:
+            with store.transaction() as tx:
+                tx.delete_project(pid)
+            return {"deleted": True}
         return {"archived": True}
 
     def project_control(pid: str, action: str):
@@ -342,8 +352,27 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
     @app.get("/projects/{pid}/messages")
     def messages(pid: str):
         with store.transaction() as tx:
-            require(tx, "projects", pid)
-            return tx.list("messages", pid)
+            project = require(tx, "projects", pid)
+            # Older runs stored tool-step narration as ordinary replies. Classify
+            # it from the recorded decision, preserving the immutable transcript.
+            legacy_progress = {
+                item["decision"]["response"]
+                for item in tx.list("decision_snapshots", pid)
+                if item.get("holon_id") == project.get("root_holon_id")
+                and item.get("decision", {}).get("response")
+                and item["decision"].get("work_orders")
+                and "progress_note" not in item["decision"]
+                and "\n\n" not in item["decision"]["response"].strip()
+                and not item["decision"]["response"].rstrip().endswith("?")
+            }
+            return [
+                {**message, "channel": "progress"}
+                if message.get("role") == "assistant"
+                and not message.get("channel")
+                and message.get("text") in legacy_progress
+                else message
+                for message in tx.list("messages", pid)
+            ]
 
     @app.post("/projects/{pid}/messages", status_code=201)
     def send_message(pid: str, body: MessageInput):
@@ -385,6 +414,9 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                     "status": "active",
                     "chat_stopped": False,
                     "model_retry_count": 0,
+                    "empty_turn_count": 0,
+                    "decision_retry_count": 0,
+                    "runtime_feedback": None,
                     "blocked_reason": None,
                     "context_epoch": root.get("context_epoch", 0) + 1,
                 },
@@ -425,6 +457,9 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                     "status": "active",
                     "chat_stopped": False,
                     "model_retry_count": 0,
+                    "empty_turn_count": 0,
+                    "decision_retry_count": 0,
+                    "runtime_feedback": None,
                     "blocked_reason": None,
                     "context_epoch": h.get("context_epoch", 0) + 1,
                 },

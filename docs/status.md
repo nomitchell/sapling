@@ -12,17 +12,21 @@ This file distinguishes shipped behavior, validation, and remaining integration 
 - Impact-assessed evidence routing with lexical vector candidate retrieval.
 - Permission modes, exact-action approval, per-project category grants, local and Docker execution adapters.
 - Hash-verified source/experiment artifacts and Windows descendant-process cleanup.
-- OpenAlex paper search, SearXNG web search, DDGS native fallback, public source capture, private file uploads.
+- OpenAlex paper search, Tavily web search when connected, SearXNG/DDGS fallback when no Tavily key is configured, public source capture, private file uploads.
+- Progress notes and tool actions share an expandable chronological transcript; substantive replies remain in chat. Historical activity loads beyond the first event page.
+- Source reads expose extracted-text references, passage search, offsets and full-text links. A persistent source catalog retains exact citation URLs. Repeated reads no longer sort ahead of other proposed actions; empty turns and stale allocations get one bounded recovery attempt.
+- Project settings expose permanent deletion of project records after stopping researchers. Cached files and local experiment folders remain on disk, as the confirmation explains.
 - Root chat, tree/holarchy inspection and controls, commons, experiments, attention, Ops, settings, credential vault and decision export.
 - Decision snapshots, explicit human node preferences and linked attention overrides; no training.
 - Account-aware model presets, custom model IDs, compatible reasoning choices and editable token prices. Default: GPT-5.4 nano, low reasoning. Keys use the OS credential vault.
 
 ## Verified in this workspace
 
-- 94 backend API, runtime, worker and adapter tests passed against SQLite and actual Windows subprocesses (2026-09-19).
+- 102 backend API, runtime, worker and adapter tests passed against SQLite and actual Windows subprocesses (2026-09-19).
 - Frontend TypeScript and production build; dependency audit with no known issues at build time.
 - Browser project creation, root message persistence, live event updates, missing-credential attention and tree inspection.
 - Live keyless OpenAlex and DDGS searches.
+- Live Tavily search, primary PDF capture, and extracted passage reading through the browser. Confirmed the connection state and deletion of a disposable project. This session also exposed empty progress-only turns, stale-value allocation errors, and citation drift; bounded recovery and persistent source references were added. Scientific output still needs scrutiny.
 - Recovered the original saved robustness question with a real response and a revised research brief. A browser research session completed after live steering, with a three-bullet linked synthesis and explicit limits on abstract-level evidence. Public arXiv source opening and a linked verification response also succeeded. The session cost $0.08266039, including earlier failures and conservative cancellation accounting.
 - Browser checks of title-only creation, model/reasoning settings, light/dark appearance, greeting, thinking/tool activity, steering, stop/continue, and Markdown tables, equations and code copying. Long conversations scroll internally; document height remains the viewport height.
 - Fixed paused-root recovery, consecutive Windows timestamp ordering, newest-tool-result retention, stale-error steering, strict map encoding and selection of the final provider message. The original failure combined paused conversation state with invalid structured output; ordinary replies now stay in chat.

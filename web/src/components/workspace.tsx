@@ -5,6 +5,7 @@ import {
   defaults,
   emptyData,
   errorText,
+  loadEvents,
   Project,
   ProjectData,
   ResearchSettings,
@@ -99,7 +100,9 @@ export function Workspace() {
       "artifacts",
     ] as const;
     const results = await Promise.allSettled(
-      paths.map((path) => api(`/projects/${id}/${path}`)),
+      paths.map((path) =>
+        path === "events" ? loadEvents(id) : api(`/projects/${id}/${path}`),
+      ),
     );
     if (selectedRef.current !== id) return;
     const update: Partial<ProjectData> = {};
@@ -494,6 +497,10 @@ export function Workspace() {
           project={settings === "project" ? selected : null}
           globalSettings={globalSettings}
           onClose={() => setSettings(null)}
+          onDelete={() => {
+            setSettings(null);
+            setArchive(true);
+          }}
           onSaved={() => {
             refresh();
             void api<ResearchSettings>("/settings").then(setGlobalSettings);
@@ -504,9 +511,16 @@ export function Workspace() {
         />
       )}
       {archive && selected && (
-        <Modal title="Archive project?" onClose={() => setArchive(false)}>
+        <Modal
+          title={`Delete “${selected.title}”?`}
+          onClose={() => setArchive(false)}
+        >
           <div className="modal-content">
-            <p>Research stops. Your conversation and records remain saved.</p>
+            <p>
+              This stops its researchers and permanently removes its
+              conversation and research records. Cached files and local
+              experiment folders remain on disk.
+            </p>
             <div className="modal-footer">
               <button
                 className="button secondary"
@@ -517,7 +531,9 @@ export function Workspace() {
               <button
                 className="button primary"
                 onClick={() =>
-                  void api(`/projects/${selected.id}`, { method: "DELETE" })
+                  void api(`/projects/${selected.id}?permanent=true`, {
+                    method: "DELETE",
+                  })
                     .then(() => {
                       setArchive(false);
                       setSelectedId(null);
@@ -526,7 +542,7 @@ export function Workspace() {
                     .catch((err) => setError(errorText(err)))
                 }
               >
-                Archive
+                Delete project
               </button>
             </div>
           </div>

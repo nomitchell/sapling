@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from sapling.runtime import (
+    CURRENT_SCOPE,
     HolonContextBuilder,
     HolonDecision,
     ResearchControl,
@@ -78,7 +79,7 @@ def store():
 
 
 def decision(**kwargs):
-    return HolonDecision(updated_summary="Current research summary", **kwargs)
+    return HolonDecision(updated_summary=kwargs.pop("updated_summary", "Current research summary"), **kwargs)
 
 
 def apply(store, value, hid="h"):
@@ -102,6 +103,31 @@ def rows(store, kind):
 def event_types(store):
     with store.transaction() as tx:
         return list(tx.conn.execute(select(events.c.type)).scalars())
+
+
+def activate_conversation(store, scope="conversation:bounded"):
+    request_id = scope.split(":", 1)[1]
+    with store.transaction() as tx:
+        tx.update(
+            "projects",
+            "p",
+            {
+                "active_conversation_id": request_id,
+                "conversation_requests": {
+                    request_id: {
+                        "id": request_id,
+                        "state": "active",
+                        "budget_total": 20,
+                        "budget_spent": 0,
+                        "budget_reserved": 0,
+                        "model_calls": 0,
+                        "max_model_calls": 48,
+                        "tool_calls": 0,
+                        "max_tool_calls": 32,
+                    }
+                },
+            },
+        )
 
 
 def test_continuous_research_cannot_apply_human_controls(store):
@@ -206,6 +232,67 @@ def test_same_node_actions_preserve_model_order_and_avoid_repeated_reads(store):
             {"kind": "read_artifact", "arguments": {"artifact_id": "paper"}}
         ]})
     assert apply(store, decision(work_orders=[read, search]))["work_order"]["kind"] == "search_web"
+
+
+def test_converse_response_remains_an_answer_while_workers_are_active(store):
+    add_child(store, "a", "na")
+    activate_conversation(store)
+    with store.transaction() as tx:
+        tx.update("holons", "a", {"work_scope": "conversation:bounded"})
+    token = CURRENT_SCOPE.set("conversation:bounded")
+    try:
+        apply(store, decision(response="Here is the useful interim synthesis."))
+    finally:
+        CURRENT_SCOPE.reset(token)
+    messages = rows(store, "messages")
+    assert messages[-1]["channel"] == "answer"
+
+
+def test_summary_only_conversation_worker_hands_off_and_wakes_parent(store):
+    add_child(store, "a", "na")
+    activate_conversation(store)
+    with store.transaction() as tx:
+        tx.update("holons", "a", {"work_scope": "conversation:bounded"})
+    token = CURRENT_SCOPE.set("conversation:bounded")
+    try:
+        apply(store, decision(updated_summary="Found the key empirical result."), "a")
+    finally:
+        CURRENT_SCOPE.reset(token)
+    assert get(store, "holons", "a")["status"] == "completed"
+    with store.transaction() as tx:
+        messages = tx.list("holon_messages", project_id="p")
+        queued = [job for job in tx.jobs("p") if job["state"] == "queued"]
+    assert messages[-1]["summary"] == "Found the key empirical result."
+    assert any(job["holon_id"] == "h" and job["kind"] == "turn" for job in queued)
+
+
+def test_branch_only_conversation_worker_gets_one_repair_then_hands_off(store):
+    add_child(store, "a", "na")
+    activate_conversation(store)
+    with store.transaction() as tx:
+        tx.update("holons", "a", {"work_scope": "conversation:bounded"})
+    token = CURRENT_SCOPE.set("conversation:bounded")
+    try:
+        apply(
+            store,
+            decision(branch_proposals=[{
+                "key": "candidate",
+                "parent_node_id": "na",
+                "title": "Unscheduled candidate",
+                "direction": "Test a discriminating hypothesis",
+                "rationale": "It could resolve the mechanism.",
+            }]),
+            "a",
+        )
+        assert get(store, "holons", "a")["status"] == "active"
+        assert get(store, "holons", "a")["runtime_feedback"]
+        apply(store, decision(updated_summary="No executable action was selected."), "a")
+    finally:
+        CURRENT_SCOPE.reset(token)
+    assert get(store, "holons", "a")["status"] == "completed"
+    assert get(store, "research_nodes", "candidate") is None
+    candidates = [node for node in rows(store, "research_nodes") if node.get("title") == "Unscheduled candidate"]
+    assert candidates[0]["status"] == "abandoned"
 
 
 def test_scheduler_selects_priority_and_saves_distillation_snapshot(store):

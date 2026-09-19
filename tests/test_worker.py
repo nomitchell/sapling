@@ -88,6 +88,39 @@ async def test_missing_key_preserves_human_input_and_creates_one_configuration_a
         assert any(event["type"] == "ATTENTION_CREATED" for event in tx.history(project["id"]))
 
 
+def test_orphaned_active_conversation_is_requeued_after_restart(worker_app):
+    _, store, worker, _ = worker_app
+    project, holon = create_project(worker_app)
+    with store.transaction() as tx:
+        tx.cancel_queued(holon["id"])
+        tx.update(
+            "projects",
+            project["id"],
+            {
+                "active_conversation_id": "orphaned",
+                "conversation_requests": {
+                    "orphaned": {
+                        "id": "orphaned",
+                        "state": "active",
+                        "budget_total": 1,
+                        "budget_spent": 0,
+                        "budget_reserved": 0,
+                        "model_calls": 0,
+                        "max_model_calls": 48,
+                        "tool_calls": 0,
+                        "max_tool_calls": 32,
+                    }
+                },
+            },
+        )
+    worker._recover_orphaned_turns()
+    with store.transaction() as tx:
+        queued = [item for item in tx.jobs(project["id"]) if item["state"] == "queued"]
+        events = tx.history(project["id"])
+    assert any(item["holon_id"] == holon["id"] and item["payload"]["work_scope"] == "conversation:orphaned" for item in queued)
+    assert any(item["type"] == "ORPHANED_TURN_RECOVERED" for item in events)
+
+
 @pytest.mark.asyncio
 async def test_baseten_rate_limit_retries_before_the_turn_fails(worker_app, monkeypatch):
     _, store, worker, _ = worker_app

@@ -87,6 +87,7 @@ class Worker:
         try:
             while True:
                 active = {task for task in active if not task.done()}
+                self._recover_orphaned_turns()
                 if len(active) < 32:
                     owner = str(uuid4())
                     job = self.store.claim(owner)
@@ -102,6 +103,48 @@ class Worker:
             for task in active:
                 task.cancel()
             await asyncio.gather(*active, return_exceptions=True)
+
+    def _recover_orphaned_turns(self):
+        """Requeue an active worker only when its scope has no live job.
+
+        This closes the crash-safe gap between a persisted active holon and
+        its next queued turn. The normal decision path maintains the same
+        invariant, while this sweep repairs older projects and restarts.
+        """
+        from .runtime import conversation_request
+
+        with self.store.transaction() as tx:
+            for project in tx.list("projects"):
+                if project.get("status") != "active":
+                    continue
+                jobs = tx.jobs(project["id"])
+                live_holons = {
+                    job["holon_id"]
+                    for job in jobs
+                    if job.get("state") in {"queued", "running"}
+                }
+                for holon in tx.list("holons", project_id=project["id"], status="active"):
+                    scope = holon.get("work_scope") or "research"
+                    if holon["id"] == project.get("root_holon_id"):
+                        request_id = project.get("active_conversation_id")
+                        if request_id:
+                            scope = "conversation:" + request_id
+                    request = conversation_request(project, scope)
+                    eligible = request is not None and request.get("state") == "active"
+                    if not eligible or holon["id"] in live_holons:
+                        continue
+                    if holon["id"] == project.get("root_holon_id") and any(
+                        child.get("status") != "completed"
+                        and child.get("work_scope") == scope
+                        for child in tx.list("holons", project_id=project["id"], parent_id=holon["id"])
+                    ):
+                        continue
+                    tx.enqueue(project["id"], holon["id"], "turn", {"reason": "orphaned_turn_recovery", "work_scope": scope})
+                    tx.event(
+                        project["id"],
+                        "ORPHANED_TURN_RECOVERED",
+                        {"holon_id": holon["id"], "work_scope": scope},
+                    )
 
     async def _perform_leased(self, job, owner):
         with self.store.transaction() as tx:

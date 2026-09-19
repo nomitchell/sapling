@@ -1518,7 +1518,14 @@ def _send(tx: Any, project: dict, sender: dict, message: HolonMessage) -> None:
         tx.enqueue(pid, recipient["id"], "turn", {"reason": "message"}, priority=message.importance)
 
 
-def _complete(tx: Any, project: dict, holon: dict, completion: HolonCompletion) -> None:
+def _complete(
+    tx: Any,
+    project: dict,
+    holon: dict,
+    completion: HolonCompletion,
+    *,
+    notify_parent: bool = True,
+) -> None:
     pid = project["id"]
     children = tx.list("holons", project_id=pid, parent_id=holon["id"])
     if any(c.get("status") != "completed" for c in children):
@@ -1560,19 +1567,20 @@ def _complete(tx: Any, project: dict, holon: dict, completion: HolonCompletion) 
                 "reason": "unused child budget returned",
             },
         )
-        tx.create(
-            "holon_messages",
-            {
-                "project_id": pid,
-                "sender_holon_id": holon["id"],
-                "recipient_holon_id": parent["id"],
-                "summary": completion.summary,
-                "claim_refs": [],
-                "evidence_refs": [],
-                "node_refs": [holon["assigned_node_id"]],
-                "importance": 0.7,
-            },
-        )
+        if notify_parent:
+            tx.create(
+                "holon_messages",
+                {
+                    "project_id": pid,
+                    "sender_holon_id": holon["id"],
+                    "recipient_holon_id": parent["id"],
+                    "summary": completion.summary,
+                    "claim_refs": [],
+                    "evidence_refs": [],
+                    "node_refs": [holon["assigned_node_id"]],
+                    "importance": 0.7,
+                },
+            )
         parent = _owned(tx, "holons", parent["id"], pid)
         tx.update("holons", parent["id"], {"context_epoch": parent.get("context_epoch", 0) + 1})
         if _runnable(tx, project, parent):
@@ -2174,24 +2182,18 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
         )
         tx.event(pid, "ASSISTANT_MESSAGE", {"message_id": note["id"], "holon_id": hid})
     if decision.response and hid == project.get("root_holon_id"):
-        active_scoped_children = any(
-            child.get("status") != "completed"
-            and child.get("work_scope") == work_scope(holon)
-            for child in tx.list("holons", project_id=pid, parent_id=hid)
-        )
         message = tx.create(
             "messages",
             {
                 "project_id": pid,
                 "holon_id": hid,
                 "role": "assistant",
+                # A substantive conversational reply belongs in Converse even
+                # while background researchers continue. Activity remains for
+                # short progress notes and tool actions.
                 "channel": (
                     "progress"
-                    if (
-                        (work_scope(holon) == "research" and project.get("research_state") == "running")
-                        or bool(decision.child_holon_requests)
-                        or active_scoped_children
-                    )
+                    if work_scope(holon) == "research" and project.get("research_state") == "running"
                     else "answer"
                 ),
                 "content": decision.response,
@@ -2354,19 +2356,55 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
             and hid != project.get("root_holon_id")
             and not work
             and not children
-            and (decision.response or decision.parent_messages)
             and not any(
                 child.get("status") != "completed"
                 for child in tx.list("holons", project_id=pid, parent_id=hid)
             )
         ):
-            # Temporary conversational researchers commonly return their
-            # finding in `response` or `parent_messages` without setting the
-            # coordinator-specific completion object. A result with no next
-            # action is an unambiguous handoff, so finish the worker and wake
-            # its parent instead of leaving an idle live node behind.
-            summary = decision.response or decision.updated_summary
-            _complete(tx, project, holon, HolonCompletion(summary=summary))
+            # A bounded conversational worker must either keep working or
+            # return. Its durable summary and collected evidence are enough
+            # for a parent handoff; requiring a model-only completion field
+            # otherwise leaves an active, unscheduled worker forever.
+            planning_only = bool(
+                decision.branch_proposals
+                or decision.node_assessments
+                or decision.node_updates
+            ) and not decision.response and not decision.parent_messages
+            repair_count = int(holon.get("empty_turn_count", 0))
+            if planning_only and repair_count == 0:
+                tx.update(
+                    "holons",
+                    hid,
+                    {
+                        "empty_turn_count": 1,
+                        "runtime_feedback": (
+                            "You proposed or assessed a branch but selected no executable next action. "
+                            "Return one work_order, delegate it, hand off your finding, or complete."
+                        ),
+                    },
+                )
+                tx.event(pid, "CONVERSATION_WORKER_REPAIR_QUEUED", {"holon_id": hid})
+                tx.enqueue(pid, hid, "turn", {"reason": "branch_without_action"})
+            else:
+                summary = decision.response or decision.updated_summary
+                # A proposed branch without selected work has no live owner
+                # once its bounded worker hands off. Preserve the summary,
+                # but do not leave an orphaned active node on the graph.
+                for node in tx.list("research_nodes", project_id=pid, owning_holon_id=hid):
+                    if node["id"] != holon.get("assigned_node_id") and node.get("status") == "active":
+                        tx.update("research_nodes", node["id"], {"status": "abandoned"})
+                        tx.event(
+                            pid,
+                            "NODE_UPDATED",
+                            {"node_id": node["id"], "status": "abandoned", "reason": "unscheduled_planning_handoff"},
+                        )
+                _complete(
+                    tx,
+                    project,
+                    holon,
+                    HolonCompletion(summary=summary),
+                    notify_parent=not bool(decision.parent_messages),
+                )
     else:
         tx.update("holons", hid, {"pending_decision_snapshot_id": snapshot["id"]})
     tx.event(

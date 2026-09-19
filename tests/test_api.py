@@ -69,8 +69,8 @@ def test_project_bootstrap_chat_and_isolation(app_client):
         project_state = tx.get("projects", p["id"])
         request = project_state["conversation_requests"][project_state["active_conversation_id"]]
         assert request["context_epoch"] == 0
-        assert request["max_model_calls"] == 24
-        assert request["max_tool_calls"] == 16
+        assert request["max_model_calls"] == 48
+        assert request["max_tool_calls"] == 32
         assert request["budget_total"] == 3
         assert tx.get("projects", p["id"])["control_epoch"] == 0
         assert len(tx.list("human_inputs", p["id"])) == 1
@@ -146,13 +146,35 @@ def test_retry_recovers_internal_decision_blocker(app_client):
             "type": "decision_rejected", "status": "pending", "pauses_subtree": True,
             "work_scope": scope, "summary": "Internal decision failure",
         })
+        child_node = tx.create("research_nodes", {
+            "project_id": p["id"], "parent_id": root["assigned_node_id"],
+            "owning_holon_id": root["id"], "title": "Temporary check",
+            "direction": "Check a paper", "status": "active",
+        })
+        child = tx.create("holons", {
+            "project_id": p["id"], "parent_id": root["id"], "goal": "Check a paper",
+            "assigned_node_id": child_node["id"], "work_scope": scope,
+            "status": "blocked", "blocked_reason": "tool_error",
+            "budget_remaining": 0.1, "budget_reserved": 0,
+        })
+        tx.update("research_nodes", child_node["id"], {
+            "owning_holon_id": child["id"], "delegated_holon_id": child["id"],
+        })
+        child_item = tx.create("attention_items", {
+            "project_id": p["id"], "holon_id": child["id"], "node_id": child_node["id"],
+            "type": "tool_error", "status": "pending", "pauses_subtree": True,
+            "work_scope": scope, "summary": "Transient paper lookup failure",
+        })
 
     assert client.post(f"/projects/{p['id']}/conversation/retry").status_code == 200
     with store.transaction() as tx:
         assert tx.get("attention_items", item["id"])["status"] == "resolved"
+        assert tx.get("attention_items", child_item["id"])["status"] == "resolved"
         assert tx.get("holons", p["root_holon_id"])["status"] == "active"
+        assert tx.get("holons", child["id"])["status"] == "active"
         assert tx.get("research_nodes", root["assigned_node_id"])["value_estimate"] == 0.5
         assert any(event["type"] == "ATTENTION_SUPERSEDED" for event in tx.history(p["id"]))
+        assert any(job["holon_id"] == child["id"] and job["state"] == "queued" for job in tx.jobs(p["id"]))
 
 
 def test_permission_approval_cannot_be_replayed(app_client):

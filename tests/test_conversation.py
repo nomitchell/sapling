@@ -7,9 +7,9 @@ from fastapi.testclient import TestClient
 from sapling.api import create_app
 from sapling.integrations.model import decode_wire, strict_wire_schema
 from sapling.runtime import (
+    CURRENT_SCOPE,
     AttentionResolution,
     ConversationSynthesis,
-    CURRENT_SCOPE,
     HolonContextBuilder,
     HolonDecision,
     NodeControl,
@@ -109,17 +109,112 @@ def test_pair_research_requires_invitation_then_later_agreement(workspace):
         project = tx.get("projects", p["id"])
         root = tx.get("holons", p["root_holon_id"])
         token = CURRENT_SCOPE.set(message_scope)
-        apply_decision(tx, project, root, HolonDecision(
+        result = apply_decision(tx, project, root, HolonDecision(
             updated_summary="The user agreed to begin continuous pair research.",
             response="Starting pair research now.",
             research_control=ResearchControl(
                 action="start", invitation_id=invitation["id"], human_input_id=message["human_input_id"]),
+            branch_proposals=[{
+                "key": "candidate",
+                "parent_node_id": root["assigned_node_id"],
+                "title": "Persistent candidate",
+                "direction": "Test the candidate after the chat turn closes",
+                "rationale": "The campaign needs persistent work",
+            }],
+            child_holon_requests=[{
+                "research_node_id": "candidate",
+                "objective": "Run the persistent candidate",
+                "requested_budget": 0.1,
+            }],
+            work_orders=[{
+                "node_id": root["assigned_node_id"],
+                "kind": "search_web",
+                "arguments": {"query": "defer this root search"},
+                "rationale": "The research coordinator should replan this after handoff",
+            }],
         ), HolonContextBuilder().build(tx, root, project))
         CURRENT_SCOPE.reset(token)
         started = tx.get("projects", p["id"])
         assert started["research_state"] == "running"
         assert started["research_invitation"]["accepted_human_input_id"] == message["human_input_id"]
+        child = tx.get("holons", result["child_holon_ids"][0])
+        assert child["work_scope"] == "research"
+        assert result["work_order"] is None
+        terminate_conversation_scope(tx, p["id"], message_scope)
+        assert tx.get("holons", child["id"])["status"] == "active"
+        assert not tx.get("holons", child["id"]).get("terminated")
         assert any(job["payload"].get("work_scope") == "research" for job in tx.jobs(p["id"]))
+
+
+def test_research_lifecycle_control_must_match_human_words(workspace):
+    client, store, p, _ = workspace
+    with store.transaction() as tx:
+        accepted = tx.create("human_inputs", {"project_id": p["id"], "text": "Yes, start pair research."})
+        tx.update("projects", p["id"], {
+            "research_state": "running",
+            "research_invitation": {
+                "id": "accepted",
+                "status": "accepted",
+                "accepted_human_input_id": accepted["id"],
+            },
+        })
+    message = client.post(f"/projects/{p['id']}/messages", json={
+        "text": "Resume continuous research and continue the parallel work.",
+    }).json()
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        token = CURRENT_SCOPE.set("conversation:" + project["active_conversation_id"])
+        try:
+            apply_decision(tx, project, root, HolonDecision(
+                updated_summary="Continuous work should continue.",
+                response="Continuing the research.",
+                research_control=ResearchControl(
+                    action="pause", human_input_id=message["human_input_id"]
+                ),
+            ), HolonContextBuilder().build(tx, root, project))
+        finally:
+            CURRENT_SCOPE.reset(token)
+        assert tx.get("projects", p["id"])["research_state"] == "running"
+        ignored = [
+            event for event in tx.history(p["id"])
+            if event["type"] == "DECISION_ACTIONS_IGNORED"
+        ]
+        assert "unauthorized_research_control" in ignored[-1]["payload"]["reasons"]
+
+
+def test_unselected_node_controls_do_not_reject_other_conversation_actions(workspace):
+    client, store, p, _ = workspace
+    message = client.post(f"/projects/{p['id']}/messages", json={
+        "text": "Continue the current discussion.",
+    }).json()
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        unselected = tx.create("research_nodes", {
+            "project_id": p["id"], "parent_id": root["assigned_node_id"], "status": "active",
+            "title": "Unselected branch", "direction": "Do not control this branch",
+            "owning_holon_id": root["id"],
+        })
+        token = CURRENT_SCOPE.set("conversation:" + project["active_conversation_id"])
+        try:
+            result = apply_decision(tx, project, root, HolonDecision(
+                updated_summary="The discussion continues.",
+                response="I will keep working with you here.",
+                node_controls=[NodeControl(
+                    node_id=unselected["id"], action="pause",
+                    human_input_id=message["human_input_id"], guidance="Pause it",
+                )],
+            ), HolonContextBuilder().build(tx, root, project))
+        finally:
+            CURRENT_SCOPE.reset(token)
+        assert result["work_order"] is None
+        assert tx.get("research_nodes", unselected["id"])["status"] == "active"
+        ignored = [
+            event for event in tx.history(p["id"])
+            if event["type"] == "DECISION_ACTIONS_IGNORED"
+        ]
+        assert "unselected_node_control" in ignored[-1]["payload"]["reasons"]
 
 
 def test_read_and_targeted_resolution_are_independent(workspace):
@@ -523,6 +618,10 @@ async def test_bounded_conversation_forces_synthesis_after_tool_limit(workspace)
         h = tx.get("holons", p["root_holon_id"])
         current = tx.get("projects", p["id"])
         scope = "conversation:" + current["active_conversation_id"]
+        request = current["conversation_requests"][current["active_conversation_id"]]
+        from sapling.runtime import update_request
+
+        update_request(tx, p["id"], scope, {**request, "max_tool_calls": 16})
 
     async def dispatch(order, *args):
         return {"summary": f"result for {order['arguments']['query']}", "cost_usd": 0}
@@ -616,6 +715,133 @@ async def test_bounded_conversation_reserves_its_last_model_call_for_an_answer(w
         assert tx.list("messages", project_id=p["id"])[-1]["text"].startswith("Here is the answer")
 
 
+@pytest.mark.asyncio
+async def test_temporary_researchers_cannot_consume_the_final_synthesis_call(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Investigate in parallel"})
+    with store.transaction() as tx:
+        current = tx.get("projects", p["id"])
+        scope = "conversation:" + current["active_conversation_id"]
+        request = current["conversation_requests"][current["active_conversation_id"]]
+        from sapling.runtime import update_request
+
+        update_request(tx, p["id"], scope, {**request, "model_calls": 9, "max_model_calls": 10})
+        root = tx.get("holons", p["root_holon_id"])
+        node = tx.create("research_nodes", {
+            "project_id": p["id"], "parent_id": root["assigned_node_id"],
+            "owning_holon_id": root["id"], "title": "Parallel check",
+            "direction": "Check one source", "status": "active",
+        })
+        child = tx.create("holons", {
+            "project_id": p["id"], "parent_id": root["id"], "work_scope": scope,
+            "goal": "Check one source", "summary": "One useful result was found.",
+            "assigned_node_id": node["id"], "budget_total": 0.5,
+            "budget_remaining": 0.5, "budget_reserved": 0, "depth": 1,
+            "status": "active", "control_epoch": 0, "turn_count": 1,
+        })
+        tx.update("research_nodes", node["id"], {
+            "owning_holon_id": child["id"], "delegated_holon_id": child["id"],
+        })
+
+    calls = 0
+
+    async def model(context, schema, settings):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("The temporary researcher must not consume the reserved call")
+
+    result = await run_turn(store, child["id"], model, None, scope=scope)
+    assert result["status"] == "blocked_or_stale"
+    assert calls == 0
+    with store.transaction() as tx:
+        current = tx.get("projects", p["id"])
+        request = current["conversation_requests"][current["active_conversation_id"]]
+        assert request["state"] == "active"
+        assert request["model_calls"] == 9
+        assert tx.get("holons", child["id"])["status"] == "completed"
+        assert any(
+            job["holon_id"] == p["root_holon_id"]
+            and job["state"] == "queued"
+            for job in tx.jobs(p["id"])
+        )
+        assert any(e["type"] == "CONVERSATION_SYNTHESIS_RESERVED" for e in tx.history(p["id"]))
+
+
+@pytest.mark.asyncio
+async def test_temporary_researcher_response_completes_and_wakes_parent(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Run a short parallel check"})
+    with store.transaction() as tx:
+        current = tx.get("projects", p["id"])
+        scope = "conversation:" + current["active_conversation_id"]
+        root = tx.get("holons", p["root_holon_id"])
+        node = tx.create("research_nodes", {
+            "project_id": p["id"], "parent_id": root["assigned_node_id"],
+            "owning_holon_id": root["id"], "title": "Short check",
+            "direction": "Find one result", "status": "active",
+        })
+        child = tx.create("holons", {
+            "project_id": p["id"], "parent_id": root["id"], "work_scope": scope,
+            "goal": "Find one result", "summary": "", "assigned_node_id": node["id"],
+            "budget_total": 0.5, "budget_remaining": 0.5, "budget_reserved": 0,
+            "depth": 1, "status": "active", "control_epoch": 0, "turn_count": 0,
+        })
+        tx.update("research_nodes", node["id"], {
+            "owning_holon_id": child["id"], "delegated_holon_id": child["id"],
+        })
+
+    async def model(context, schema, settings):
+        return {
+            "decision": HolonDecision(
+                response="The strongest result is the primary study at https://example.test/paper.",
+                updated_summary="Found and returned one primary result.",
+            ),
+            "usage": {}, "cost_usd": 0,
+        }
+
+    await run_turn(store, child["id"], model, None, scope=scope)
+    with store.transaction() as tx:
+        completed = tx.get("holons", child["id"])
+        assert completed["status"] == "completed"
+        messages = tx.list("holon_messages", project_id=p["id"])
+        assert messages[-1]["recipient_holon_id"] == p["root_holon_id"]
+        assert "strongest result" in messages[-1]["summary"]
+        assert any(
+            job["holon_id"] == p["root_holon_id"] and job["state"] == "queued"
+            for job in tx.jobs(p["id"])
+        )
+
+
+@pytest.mark.asyncio
+async def test_conversational_root_keeps_follow_up_questions_in_chat(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "What should we do next?"})
+    with store.transaction() as tx:
+        current = tx.get("projects", p["id"])
+        scope = "conversation:" + current["active_conversation_id"]
+
+    async def model(context, schema, settings):
+        return {
+            "decision": HolonDecision(
+                response="I would test the narrower hypothesis first. Does that match your intuition?",
+                updated_summary="Proposed a focused next test in conversation.",
+                attention_assessments=[{
+                    "importance": 0.8, "decision_value": 0.9,
+                    "summary": "Choose the next hypothesis", "possible_responses": ["Narrow", "Broad"],
+                }],
+            ),
+            "usage": {}, "cost_usd": 0,
+        }
+
+    await run_turn(store, p["root_holon_id"], model, None, scope=scope)
+    with store.transaction() as tx:
+        assert tx.list("attention_items", p["id"]) == []
+        assert tx.get("holons", p["root_holon_id"])["status"] == "active"
+        messages = tx.list("messages", project_id=p["id"])
+        assert messages[-1]["channel"] == "answer"
+        assert "intuition" in messages[-1]["text"]
+
+
 def test_source_catalog_keeps_exact_citations_after_tool_history_rolls_off(workspace):
     _, store, p, _ = workspace
     with store.transaction() as tx:
@@ -689,7 +915,8 @@ def test_structured_maps_preserve_nested_tool_arguments():
 @pytest.mark.asyncio
 async def test_output_limit_is_distinguished_from_invalid_decision():
     from types import SimpleNamespace
-    from sapling.integrations.model import OpenAIModelRuntime, ModelResponseError
+
+    from sapling.integrations.model import ModelResponseError, OpenAIModelRuntime
 
     async def create(**kwargs):
         return SimpleNamespace(
@@ -716,6 +943,7 @@ async def test_output_limit_is_distinguished_from_invalid_decision():
 @pytest.mark.asyncio
 async def test_only_final_structured_message_is_applied():
     from types import SimpleNamespace as NS
+
     from sapling.integrations.model import OpenAIModelRuntime
 
     preview = json.dumps({"updated_summary": "Draft", "response": "Draft response"})

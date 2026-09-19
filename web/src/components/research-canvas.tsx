@@ -74,7 +74,9 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
   }, [readIds, onRefresh, onError]);
   const jobs = (Array.isArray(data.stats.jobs) ? data.stats.jobs as RecordItem[] : []);
   const runningHolons = new Set(jobs.filter(job => job.state === "running").map(job => String(job.holon_id || "")));
+  const queuedHolons = new Set(jobs.filter(job => job.state === "queued").map(job => String(job.holon_id || "")));
   const runningNodes = new Set(data.holarchy.filter(holon => runningHolons.has(holon.id)).map(holon => String(holon.assigned_node_id || "")));
+  const queuedNodes = new Set(data.holarchy.filter(holon => queuedHolons.has(holon.id)).map(holon => String(holon.assigned_node_id || "")));
   function attentionCounts(id: string, recursive: boolean, seen = new Set<string>()): { unread: number; blocked: number; running: number } {
     if (seen.has(id)) return { unread: 0, blocked: 0, running: 0 };
     seen.add(id);
@@ -141,13 +143,15 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
         {result.nodes.map(({ record, x, y, children }) => {
           const count = attentionCounts(record.id, collapsed.has(record.id));
           const isRoot = !record.parent_id;
-          const state = count.blocked ? "blocked" : count.unread ? "unread" : record.status === "completed" ? "completed" : record.status === "paused" ? "paused" : count.running ? "running" : "ready";
+          const done = record.status === "completed" || record.status === "abandoned";
+          const state = count.blocked ? "blocked" : count.unread ? "unread" : done ? "done" : record.status === "paused" ? "paused" : count.running ? "running" : queuedNodes.has(record.id) || (!isRoot && Number(record.visits || 0) === 0) ? "queued" : "idle";
+          const agentState = runningNodes.has(record.id) ? "running" : state === "queued" ? "queued" : state === "done" ? "done" : "idle";
           const title = isRoot ? "Converse" : field(record, "title", "question", "goal") || project.title;
           return <div className={`research-node state-${state} ${selectedId === record.id ? "selected" : ""}`} key={record.id} style={{ left: x, top: y, width: WIDTH, height: HEIGHT }}>
             <button className="research-node-main" aria-label={`${title}, ${state === "unread" ? "check me" : state}`} aria-pressed={selectedId === record.id} onClick={() => { setSelectedId(record.id); setCopied(false); }}>
-              <span className="research-node-top"><span>{isRoot ? <Sprout size={13} /> : <GitBranch size={12} />}{isRoot ? "Converse" : label(record.type || "inquiry")}</span><span className={`node-agent-status ${runningNodes.has(record.id) ? "running" : "idle"}`} title={runningNodes.has(record.id) ? "Agent running on this node" : "No agent running on this node"}><i />{runningNodes.has(record.id) ? "live" : "idle"}</span></span>
+              <span className="research-node-top"><span>{isRoot ? <Sprout size={13} /> : <GitBranch size={12} />}{isRoot ? "Converse" : label(record.type || "inquiry")}</span><span className={`node-agent-status ${agentState}`} title={agentState === "running" ? "Agent running on this node" : agentState === "queued" ? "Agent work is queued" : agentState === "done" ? "This node has completed its purpose" : "No agent running on this node"}><i />{agentState === "running" ? "live" : agentState}</span></span>
               <strong>{title}</strong>
-              <span className="research-node-bottom">{state === "blocked" ? "Needs your input" : state === "unread" ? "Check me" : state === "running" ? "Researching" : state === "ready" ? "Ready to explore" : label(state)}{collapsed.has(record.id) && (count.running + count.unread + count.blocked > 0) && <small>{count.blocked ? `${count.blocked} waiting` : count.unread ? `${count.unread} unread` : `${count.running} active`}</small>}</span>
+              <span className="research-node-bottom">{state === "blocked" ? "Needs your input" : state === "unread" ? "Check me" : state === "running" ? "Researching" : state === "queued" ? "Queued" : state === "done" ? "Done" : state === "idle" ? "Idle" : label(state)}{collapsed.has(record.id) && (count.running + count.unread + count.blocked > 0) && <small>{count.blocked ? `${count.blocked} waiting` : count.unread ? `${count.unread} unread` : `${count.running} active`}</small>}</span>
             </button>
             {children > 0 && <button className="node-collapse" aria-label={`${collapsed.has(record.id) ? "Expand" : "Collapse"} ${title}`} aria-expanded={!collapsed.has(record.id)} onClick={() => setCollapsed(current => { const next = new Set(current); if (next.has(record.id)) next.delete(record.id); else next.add(record.id); return next; })}>{collapsed.has(record.id) ? <ChevronRight size={12} /> : <ChevronDown size={12} />}<span>{children}</span></button>}
           </div>;
@@ -164,7 +168,7 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
         {selectedAttention.map(item => <article className={`node-attention ${item.pauses_subtree || item.type === "permission" ? "blocking" : ""}`} key={item.id}><strong>{item.pauses_subtree || item.type === "permission" ? "Waiting for your input" : "Research update"}</strong><Markdown>{field(item, "summary", "description")}</Markdown><small>{item.pauses_subtree || item.type === "permission" ? "Discuss in Converse to resolve this. Reading does not resume work." : "Work continues while you review this update."}</small></article>)}
         {field(selected, "summary", "description") && <div className="node-summary"><Markdown>{field(selected, "summary", "description")}</Markdown></div>}
         {field(selected, "question") && field(selected, "question") !== field(selected, "title") && <div className="node-summary"><Markdown>{field(selected, "question")}</Markdown></div>}
-        <dl className="node-facts"><div><dt>Status</dt><dd>{label(selected.status || "ready")}</dd></div>{selected.estimated_cost !== undefined && <div><dt>Next effort</dt><dd>{money(selected.estimated_cost)}</dd></div>}</dl>
+        <dl className="node-facts"><div><dt>Status</dt><dd>{selected.status === "completed" || selected.status === "abandoned" ? "Done" : runningNodes.has(selected.id) ? "Running" : queuedNodes.has(selected.id) || (selected.parent_id && Number(selected.visits || 0) === 0) ? "Queued" : selected.status === "paused" ? "Paused" : "Idle"}</dd></div>{selected.estimated_cost !== undefined && <div><dt>Next effort</dt><dd>{money(selected.estimated_cost)}</dd></div>}</dl>
         <NodeRecords data={data} node={selected} />
       </div>
       <footer><button className="button primary" onClick={() => onDiscuss({ nodeId: selected.id, title: field(selected, "title", "question", "goal") || project.title, attentionIds: selectedAttention.map(item => item.id) })}><MessageSquare size={14} />Discuss in Converse</button></footer>

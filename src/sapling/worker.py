@@ -257,7 +257,7 @@ class Worker:
                         project["id"], "ATTENTION_CREATED", {"attention_id": item["id"], "summary": problem}
                     )
             return
-        from .integrations.model import model_runtime, input_token_bound
+        from .integrations.model import input_token_bound, model_runtime
         from .runtime import INSTRUCTIONS, run_turn
 
         settings = project["settings"]
@@ -315,7 +315,7 @@ class Worker:
         kind, args = order["kind"], order.get("arguments", {})
         pid = project["id"]
         with self.store.transaction() as tx:
-            from .runtime import _runnable
+            from .runtime import _runnable, work_scope
             latest = tx.get("projects", pid)
             current = tx.get("holons", holon["id"])
             node = tx.get("research_nodes", order["node_id"])
@@ -381,6 +381,7 @@ class Worker:
                             "status": "pending",
                             "summary": f"Permission requested: {category.replace('_', ' ')}. {order.get('rationale', '')}",
                             "work_order": order,
+                            "work_scope": work_scope(current),
                         },
                     )
                     tx.event(pid, "ATTENTION_CREATED", {"attention_id": item["id"], "category": category})
@@ -541,8 +542,9 @@ class Worker:
         return await self.experiment(order, holon, project)
 
     async def experiment(self, order, holon, project):
-        from .integrations.execution import LocalDockerBackend, LocalProcessBackend
         import time
+
+        from .integrations.execution import LocalDockerBackend, LocalProcessBackend
 
         args, pid = order["arguments"], project["id"]
         command = args.get("command")

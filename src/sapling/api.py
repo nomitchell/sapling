@@ -103,8 +103,8 @@ def record_conversation(tx, project, text, node_ids=None, attention_ids=None):
         available = max(0, project["budget_total"] - project.get("budget_spent", 0) - project.get("budget_reserved", 0))
         requests[request_id] = {"id": request_id, "state": "active", "control_epoch": 0,
             "context_epoch": 0, "budget_total": min(3.0, available), "budget_spent": 0,
-            "budget_reserved": 0, "model_calls": 0, "max_model_calls": 24,
-            "tool_calls": 0, "max_tool_calls": 16, "tool_history": [],
+            "budget_reserved": 0, "model_calls": 0, "max_model_calls": 48,
+            "tool_calls": 0, "max_tool_calls": 32, "tool_history": [],
             "latest_human_input_id": human["id"]}
         tx.update("projects", pid, {"active_conversation_id": request_id, "conversation_requests": requests})
     else:
@@ -112,8 +112,8 @@ def record_conversation(tx, project, text, node_ids=None, attention_ids=None):
             "latest_human_input_id": human["id"],
             "context_epoch": request.get("context_epoch", 0) + 1,
             "budget_total": max(request.get("budget_total", 0), min(3.0, project["budget_total"])),
-            "max_model_calls": max(request.get("max_model_calls", 0), 24),
-            "max_tool_calls": max(request.get("max_tool_calls", 0), 16),
+            "max_model_calls": max(request.get("max_model_calls", 0), 48),
+            "max_tool_calls": max(request.get("max_tool_calls", 0), 32),
         })
     message = tx.create("messages", {"project_id": pid, "role": "user", "text": text,
         "human_input_id": human["id"], "node_ids": node_ids, "attention_ids": attention_ids,
@@ -490,16 +490,36 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                 record_conversation(tx, p, human["text"], human.get("node_ids"), human.get("attention_ids"))
             else:
                 scope = "conversation:" + request_id
+                affected_holons: set[str] = set()
+                recoverable_types = {
+                    "decision_rejected",
+                    "model_error",
+                    "output_limit",
+                    "tool_error",
+                    "error",
+                    "no_research_action",
+                }
                 for item in tx.list("attention_items", pid, status="pending"):
-                    if item.get("type") == "decision_rejected" and item.get("work_scope") == scope:
+                    if item.get("type") in recoverable_types and item.get("work_scope") == scope:
                         tx.update("attention_items", item["id"], {
                             "status": "resolved",
-                            "resolution": "Superseded by automatic runtime recovery",
+                            "resolution": "Superseded by the user's retry",
                             "resolved_at": now(),
                         })
                         tx.event(pid, "ATTENTION_SUPERSEDED", {"attention_id": item["id"]})
+                        if item.get("holon_id"):
+                            affected_holons.add(item["holon_id"])
                 update_request(tx, pid, scope, {"state": "active", "control_epoch": request.get("control_epoch", 0) + 1})
                 root = require(tx, "holons", p["root_holon_id"])
+                affected_holons.update(
+                    holon["id"]
+                    for holon in tx.list("holons", pid)
+                    if holon.get("work_scope") == scope
+                    and holon.get("parent_id")
+                    and holon.get("status") in {"active", "blocked", "error"}
+                    and not holon.get("manual_paused")
+                    and not holon.get("terminated")
+                )
                 node = require(tx, "research_nodes", root["assigned_node_id"])
                 if node.get("value_estimate") is None:
                     tx.update("research_nodes", node["id"], {
@@ -507,9 +527,13 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                         "value_confidence": 0.0,
                         "evidence_epoch": p.get("evidence_epoch", 0),
                     })
-                root = refresh_blockers(tx, pid, root["id"])
-                tx.update("holons", root["id"], {"model_retry_count": 0, "empty_turn_count": 0,
-                    "decision_retry_count": 0, "runtime_feedback": None})
+                affected_holons.add(root["id"])
+                for holon_id in affected_holons:
+                    resumed = refresh_blockers(tx, pid, holon_id)
+                    tx.update("holons", holon_id, {"model_retry_count": 0, "empty_turn_count": 0,
+                        "decision_retry_count": 0, "runtime_feedback": None})
+                    if holon_id != root["id"] and resumed.get("status") == "active":
+                        tx.enqueue(pid, holon_id, "turn", {"reason": "conversation_retry", "work_scope": scope})
                 tx.enqueue(pid, root["id"], "turn", {"reason": "conversation_retry", "work_scope": scope})
             tx.event(pid, "CONVERSATION_RETRIED", {})
         return {"status": "queued"}

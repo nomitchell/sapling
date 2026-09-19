@@ -339,6 +339,221 @@ def test_recursive_delegation_conserves_money_and_returns_unused_budget(store):
     assert get(store, "projects", "p")["budget_spent"] == 0
 
 
+def test_parallel_delegation_automatically_shares_budget_and_ignores_zero_transfer(store):
+    add_branch(store, "empirical", value=0.9)
+    add_branch(store, "alternatives", value=0.8)
+    parsed = decision(
+        budget_transfers=[{"child_holon_id": "provider-placeholder", "amount": 0, "reason": "none"}],
+        child_holon_requests=[
+            {"research_node_id": "empirical", "objective": "Map empirical recipes", "requested_budget": 0},
+            {"research_node_id": "alternatives", "objective": "Find direct alternatives"},
+        ],
+    )
+    assert parsed.child_holon_requests[0].requested_budget is None
+
+    result = apply(store, parsed)
+    children = [get(store, "holons", child_id) for child_id in result["child_holon_ids"]]
+    assert len(children) == 2
+    assert [child["budget_remaining"] for child in children] == pytest.approx([20 / 3, 20 / 3])
+    assert get(store, "holons", "h")["budget_remaining"] == pytest.approx(20 / 3)
+    assert event_types(store).count("BUDGET_REALLOCATED") == 2
+
+
+def test_research_scheduler_launches_current_frontier_into_available_worker_slots(store):
+    with store.transaction() as tx:
+        project = tx.get("projects", "p")
+        tx.update("projects", "p", {
+            "research_state": "running",
+            "settings": {**project["settings"], "max_concurrent_holons": 4},
+        })
+    for node_id, value in (("candidate-a", 0.9), ("candidate-b", 0.8), ("candidate-c", 0.7)):
+        add_branch(store, node_id, value=value)
+
+    result = apply(store, decision(response="The candidate population is ready."))
+
+    assert len(result["child_holon_ids"]) == 3
+    children = [get(store, "holons", child_id) for child_id in result["child_holon_ids"]]
+    assert {child["assigned_node_id"] for child in children} == {
+        "candidate-a", "candidate-b", "candidate-c",
+    }
+    assert all(child["work_scope"] == "research" for child in children)
+    assert event_types(store).count("SCHEDULER_AUTODELEGATED") == 1
+    with store.transaction() as tx:
+        queued = [job for job in tx.jobs("p") if job["state"] == "queued"]
+    assert {job["holon_id"] for job in queued} == set(result["child_holon_ids"])
+
+
+def test_stale_untargeted_branch_does_not_block_current_candidate(store):
+    add_branch(store, "fresh", value=0.9)
+    add_branch(store, "stale", value=0.8)
+    with store.transaction() as tx:
+        tx.update("projects", "p", {"evidence_epoch": 1})
+        tx.update("research_nodes", "fresh", {"evidence_epoch": 1})
+
+    result = apply(store, decision(work_orders=[work("fresh")]))
+
+    assert result["work_order"]["node_id"] == "fresh"
+
+
+def test_parallel_delegation_ignores_empty_experiment_placeholder(store):
+    add_branch(store, "empirical", value=0.9)
+    add_branch(store, "alternatives", value=0.8)
+    result = apply(
+        store,
+        decision(
+            child_holon_requests=[
+                {"research_node_id": "empirical", "objective": "Verify one empirical result"},
+                {"research_node_id": "alternatives", "objective": "Find one direct alternative"},
+            ],
+            work_orders=[{
+                "node_id": "n",
+                "kind": "run_experiment",
+                "arguments": {},
+                "rationale": "Parent is waiting for child results; no direct work this decision.",
+                "estimated_cost": 0,
+            }],
+        ),
+    )
+    assert len(result["child_holon_ids"]) == 2
+    assert result["work_order"] is None
+    assert "MODEL_PLACEHOLDER_IGNORED" in event_types(store)
+
+
+def test_empty_experiment_without_delegation_is_rejected_before_permission(store):
+    with pytest.raises(RuntimeRejected, match="nonempty command"):
+        apply(
+            store,
+            decision(work_orders=[{
+                "node_id": "n", "kind": "run_experiment", "arguments": {},
+                "rationale": "Run code", "estimated_cost": 0,
+            }]),
+        )
+
+
+def test_new_branch_placeholder_resolves_to_the_branch_created_in_the_same_decision(store):
+    result = apply(
+        store,
+        decision(
+            branch_proposals=[
+                {
+                    "key": "new",
+                    "parent_node_id": "new",
+                    "title": "Empirical controls",
+                    "direction": "Verify the empirical recipe",
+                    "rationale": "Independent literature check",
+                }
+            ],
+            child_holon_requests=[
+                {
+                    "research_node_id": "new",
+                    "objective": "Verify the empirical recipe",
+                    "requested_budget": 0,
+                }
+            ],
+        ),
+    )
+    child = get(store, "holons", result["child_holon_ids"][0])
+    node = get(store, "research_nodes", child["assigned_node_id"])
+    assert node["parent_id"] == "n"
+    assert node["title"] == "Empirical controls"
+
+
+def test_repeated_visible_branch_proposal_reuses_node_before_delegation(store):
+    add_branch(store, "published")
+    with store.transaction() as tx:
+        tx.update(
+            "research_nodes",
+            "published",
+            {
+                "title": "Teacher signal feasibility",
+                "direction": "Specify the diffusion teacher supervision signal",
+            },
+        )
+
+    result = apply(
+        store,
+        decision(
+            branch_proposals=[
+                {
+                    "key": "teacher-signal",
+                    "parent_node_id": "n",
+                    "title": "Teacher signal feasibility",
+                    "direction": "Specify the diffusion teacher supervision signal",
+                    "rationale": "This branch was published during conversation",
+                }
+            ],
+            child_holon_requests=[
+                {
+                    "research_node_id": "teacher-signal",
+                    "objective": "Price and validate the teacher signal",
+                    "requested_budget": 1,
+                }
+            ],
+        ),
+    )
+
+    assert len(rows(store, "research_nodes")) == 2
+    child = get(store, "holons", result["child_holon_ids"][0])
+    assert child["assigned_node_id"] == "published"
+    assert "NODE_REUSED" in event_types(store)
+
+
+def test_candidate_successor_records_operator_generation_and_cross_branch_lineage(store):
+    apply(
+        store,
+        decision(
+            branch_proposals=[
+                {
+                    "key": "baseline",
+                    "parent_node_id": "n",
+                    "title": "Baseline candidate",
+                    "direction": "Measure the direct baseline",
+                    "rationale": "A common point of comparison",
+                },
+                {
+                    "key": "successor",
+                    "parent_node_id": "n",
+                    "title": "Combined candidate",
+                    "direction": "Combine the strongest mechanisms",
+                    "rationale": "Cross-branch evidence suggests a useful recombination",
+                    "operator": "merge",
+                    "inspired_by_node_ids": ["baseline"],
+                },
+            ]
+        ),
+    )
+
+    nodes = {node["title"]: node for node in rows(store, "research_nodes")}
+    successor = nodes["Combined candidate"]
+    baseline = nodes["Baseline candidate"]
+    assert successor["search_operator"] == "merge"
+    assert successor["generation"] == 1
+    references = rows(store, "research_references")
+    assert len(references) == 1
+    assert references[0]["source_node_id"] == baseline["id"]
+    assert references[0]["target_node_id"] == successor["id"]
+    assert references[0]["relation"] == "inspired_by"
+    with store.transaction() as tx:
+        context = HolonContextBuilder().build(tx, tx.get("holons", "h"), tx.get("projects", "p"))
+    assert context["research_lineage"][0]["target_node_id"] == successor["id"]
+
+
+def test_delegating_the_coordinator_node_materializes_distinct_child_directions(store):
+    result = apply(
+        store,
+        decision(
+            child_holon_requests=[
+                {"research_node_id": "n", "objective": "Verify empirical controls"},
+                {"research_node_id": "n", "objective": "Find direct alternatives"},
+            ]
+        ),
+    )
+    children = [get(store, "holons", child_id) for child_id in result["child_holon_ids"]]
+    node_ids = {child["assigned_node_id"] for child in children}
+    assert len(node_ids) == 2
+    assert {get(store, "research_nodes", node_id)["parent_id"] for node_id in node_ids} == {"n"}
+
+
 def test_child_allocation_cannot_exceed_unreserved_parent_money(store):
     add_branch(store)
     with store.transaction() as tx:
@@ -824,6 +1039,39 @@ async def test_approved_work_helper_wakes_next_coordinator_turn(store):
     assert len(queued) == 1
 
 
+async def test_read_only_tool_failure_in_bounded_conversation_recovers_without_attention(store):
+    from sapling.integrations.search import SearchUnavailable
+
+    scope = "conversation:bounded"
+    with store.transaction() as tx:
+        tx.update(
+            "projects",
+            "p",
+            {
+                "active_conversation_id": "bounded",
+                "conversation_requests": {
+                    "bounded": {
+                        "id": "bounded",
+                        "state": "active",
+                        "tool_calls": 0,
+                        "max_tool_calls": 16,
+                    }
+                },
+            },
+        )
+        tx.update("holons", "h", {"work_scope": scope})
+
+    async def dispatch(*args):
+        raise SearchUnavailable("No paper match")
+
+    result = await execute_work_order(store, "h", work(kind="read_paper"), dispatch)
+    assert result["recoverable"] is True
+    holon = get(store, "holons", "h")
+    assert holon["status"] == "active"
+    assert "different discovery route" in holon["runtime_feedback"]
+    assert not rows(store, "attention_items")
+
+
 async def test_message_arriving_during_parent_decision_invalidates_old_actions(store):
     add_child(store, "a", "na")
 
@@ -875,3 +1123,27 @@ async def test_invalid_model_response_preserves_sanitized_known_usage(store):
     assert get(store, "projects", "p")["budget_spent"] == 0.125
     assert get(store, "projects", "p")["budget_reserved"] == 0
     assert not rows(store, "decision_snapshots")
+
+
+async def test_invalid_structured_response_gives_the_repair_turn_field_level_feedback(store):
+    from sapling.integrations.model import ModelResponseError
+
+    async def model(*args):
+        raise ModelResponseError(
+            "Invalid structured response",
+            usage={"input_tokens": 100, "output_tokens": 40},
+            cost_usd=0.01,
+            diagnostics=[
+                {
+                    "path": ["child_holon_requests", 0, "requested_budget"],
+                    "type": "greater_than",
+                }
+            ],
+        )
+
+    result = await run_turn(store, "h", model, None)
+    assert result["status"] == "blocked_or_stale"
+    holon = get(store, "holons", "h")
+    assert holon["model_retry_count"] == 1
+    assert "child_holon_requests.0.requested_budget" in holon["runtime_feedback"]
+    assert "zero-value budget transfer" in holon["runtime_feedback"]

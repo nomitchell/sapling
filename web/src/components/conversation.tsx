@@ -382,9 +382,10 @@ export function Conversation({
               </article>
             ) : null,
           )}
-          {(busy || handingOffResponse) && streamedResponse && <article className="chat-message assistant streaming-response" aria-live="polite">
+          {(busy || handingOffResponse || (problem && awaitingAnswer)) && streamedResponse && <article className={`chat-message assistant streaming-response${problem && !busy ? " interrupted" : ""}`} aria-live="polite">
             <header><Sparkles size={15} /><strong>Sapling</strong><span className="streaming-cursor" aria-hidden="true" /></header>
             <Markdown>{streamedResponse}</Markdown>
+            {problem && !busy && <small className="interrupted-note">Interrupted before the proposed actions were applied.</small>}
           </article>}
           {data.attention
             .filter(

@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from sapling.integrations.execution import (
     LocalDockerBackend,
     LocalProcessBackend,
+    Workspace,
     WorkspaceViolation,
     contained_path,
     sanitized_environment,
@@ -325,6 +326,20 @@ async def test_process_exec_snapshot_capture_and_timeout(tmp_path):
     assert Path(result.manifest_path).exists()
     timeout = await backend.run(workspace, [sys.executable, "-c", "import time;time.sleep(30)"], timeout_seconds=0.2)
     assert timeout.timed_out and timeout.duration_seconds < 10
+
+
+def test_local_process_prefers_configured_venv_for_bare_python(tmp_path):
+    venv_python = tmp_path / "venv" / "Scripts" / "python.exe"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("placeholder")
+    backend = LocalProcessBackend(tmp_path / "workspaces", python_executable=venv_python)
+    workspace = Workspace("project", "experiment", tmp_path / "code", tmp_path / "records")
+    assert backend._command(workspace, ["python", "experiment.py"], "run") == [
+        str(venv_python.resolve()), "experiment.py"
+    ]
+    assert backend._command(workspace, [sys.executable, "experiment.py"], "run") == [
+        sys.executable, "experiment.py"
+    ]
 
 
 @pytest.mark.asyncio

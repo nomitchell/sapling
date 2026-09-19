@@ -172,13 +172,40 @@ class _Running:
 class LocalProcessBackend:
     backend_name = "local_process"
 
-    def __init__(self, root: str | Path, *, max_log_bytes: int = 2_000_000, max_artifact_bytes: int = 100_000_000, max_artifact_files: int = 2000) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        python_executable: str | Path | None = None,
+        max_log_bytes: int = 2_000_000,
+        max_artifact_bytes: int = 100_000_000,
+        max_artifact_files: int = 2000,
+    ) -> None:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.python_executable = self._resolve_python(python_executable)
         self.max_log_bytes = max_log_bytes
         self.max_artifact_bytes = max_artifact_bytes
         self.max_artifact_files = max_artifact_files
         self._running: dict[str, _Running] = {}
+
+    @staticmethod
+    def _resolve_python(configured: str | Path | None) -> Path | None:
+        """Prefer the user's established local environment for bare Python jobs.
+
+        Research code remains in an isolated workspace, but its interpreter can
+        deliberately reuse a local scientific environment instead of creating
+        package installs per experiment. An explicit executable in a work order
+        is never rewritten.
+        """
+        requested = configured or os.environ.get("SAPLING_LOCAL_PYTHON")
+        if requested:
+            candidate = Path(requested).expanduser().resolve()
+            if not candidate.is_file():
+                raise ExecutionUnavailable(f"Configured local Python was not found: {candidate}")
+            return candidate
+        default = Path.home() / "venv" / "Scripts" / "python.exe"
+        return default if default.is_file() else None
 
     def _validate(self, workspace: Workspace) -> None:
         expected = self.root / _identifier(workspace.project_id) / _identifier(workspace.experiment_id)
@@ -335,6 +362,11 @@ class LocalProcessBackend:
         return record
 
     def _command(self, workspace: Workspace, command: list[str], run_id: str) -> list[str]:
+        if (
+            self.python_executable
+            and command[0].casefold() in {"python", "python.exe"}
+        ):
+            return [str(self.python_executable), *command[1:]]
         return command
 
     async def _terminate(self, running: _Running) -> None:

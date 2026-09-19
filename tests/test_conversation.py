@@ -14,10 +14,12 @@ from sapling.runtime import (
     ConversationSynthesis,
     HolonContextBuilder,
     HolonDecision,
+    HolonMessage,
     InvitationIntent,
     NodeControl,
     ResearchControl,
     _runnable,
+    _send,
     apply_decision,
     apply_invitation_intent,
     run_turn,
@@ -246,6 +248,29 @@ def test_only_fresh_direct_child_reports_can_bubble_to_converse(workspace):
         answers = [m for m in tx.list("messages", p["id"]) if m.get("channel") == "answer"]
         assert [m["text"] for m in answers] == ["The child result changes our next step."]
         assert tx.list("holon_messages", p["id"], recipient_holon_id=root["id"])[0].get("consumed_at")
+
+
+def test_direct_child_update_is_recorded_as_a_child_report(workspace):
+    _, store, p, _ = workspace
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        child_node = tx.create("research_nodes", {
+            "project_id": p["id"], "parent_id": root["assigned_node_id"],
+            "owning_holon_id": root["id"], "title": "Child", "direction": "Check a result",
+            "status": "active", "value_estimate": 0.7, "estimated_cost": 0.1,
+        })
+        child = tx.create("holons", {
+            "project_id": p["id"], "parent_id": root["id"], "assigned_node_id": child_node["id"],
+            "status": "active", "work_scope": "research", "goal": "Check a result",
+        })
+        _send(tx, project, child, HolonMessage(
+            recipient_holon_id=root["id"], summary="An intermediate result changes the candidate.",
+            node_refs=[child_node["id"]], importance=0.8,
+        ))
+        report = tx.list("holon_messages", p["id"], recipient_holon_id=root["id"])[0]
+        assert report["kind"] == "child_report"
+        assert any(event["type"] == "CHILD_REPORT_READY" for event in tx.history(p["id"]))
 
 
 @pytest.mark.parametrize("decision", ["decline", "continue_planning", "unclear"])

@@ -1662,11 +1662,29 @@ def _send(tx: Any, project: dict, sender: dict, message: HolonMessage) -> None:
             raise RuntimeRejected("Peer messaging requires an active bounded channel")
         channel = valid_channels[0]
         tx.update("peer_channels", channel["id"], {"remaining_messages": channel["remaining_messages"] - 1})
+    is_direct_child_report = recipient["id"] == sender.get("parent_id")
     record = tx.create(
-        "holon_messages", {"project_id": pid, "sender_holon_id": sender["id"], **message.model_dump()}
+        "holon_messages",
+        {
+            "project_id": pid,
+            "sender_holon_id": sender["id"],
+            "kind": "child_report" if is_direct_child_report else "message",
+            **message.model_dump(),
+        },
     )
     tx.update("holons", recipient["id"], {"context_epoch": recipient.get("context_epoch", 0) + 1})
     tx.event(pid, "MESSAGE_SENT", {"message_id": record["id"], "recipient_holon_id": recipient["id"]})
+    if is_direct_child_report:
+        tx.event(
+            pid,
+            "CHILD_REPORT_READY",
+            {
+                "message_id": record["id"],
+                "child_holon_id": sender["id"],
+                "parent_holon_id": recipient["id"],
+                "node_ids": message.node_refs,
+            },
+        )
     if _runnable(tx, project, recipient):
         tx.enqueue(pid, recipient["id"], "turn", {"reason": "message"}, priority=message.importance)
 

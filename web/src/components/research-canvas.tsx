@@ -2,7 +2,7 @@
 
 import { api, date, errorText, field, label, money, type ConversationReference, type Project, type ProjectData, type RecordItem } from "@/lib/api";
 import { Check, ChevronDown, ChevronRight, Copy, Expand, ExternalLink, GitBranch, MessageSquare, Minus, Plus, Sprout, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent, type WheelEvent } from "react";
 import { Markdown } from "./ui";
 
 type PositionedNode = { record: RecordItem; x: number; y: number; parent?: string; children: number };
@@ -98,13 +98,22 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
     const zoom = Math.min(1, Math.max(.18, Math.min((rect.width - 100) / result.width, (rect.height - 180) / result.height)));
     setView({ x: (rect.width - result.width * zoom) / 2, y: Math.max(95, (rect.height - result.height * zoom) / 2), zoom });
   }
-  function zoomBy(factor: number) {
+  function zoomAt(factor: number, clientX?: number, clientY?: number) {
     setView(current => {
       const rect = viewport.current?.getBoundingClientRect();
       const zoom = Math.max(.18, Math.min(1.8, current.zoom * factor));
-      const cx = (rect?.width || 600) / 2, cy = (rect?.height || 500) / 2;
+      const cx = clientX !== undefined && rect ? clientX - rect.left : (rect?.width || 600) / 2;
+      const cy = clientY !== undefined && rect ? clientY - rect.top : (rect?.height || 500) / 2;
       return { x: cx - (cx - current.x) * zoom / current.zoom, y: cy - (cy - current.y) * zoom / current.zoom, zoom };
     });
+  }
+  function zoomBy(factor: number) { zoomAt(factor); }
+  function zoomWithWheel(event: WheelEvent<HTMLDivElement>) {
+    event.preventDefault();
+    // Trackpads produce small deltas and mouse wheels produce larger steps. Exponential scaling
+    // makes both feel continuous while keeping the graph under the pointer.
+    const factor = Math.exp(-event.deltaY * 0.0015);
+    zoomAt(factor, event.clientX, event.clientY);
   }
   function startPan(event: PointerEvent<HTMLDivElement>) {
     if (event.button !== 0 || (event.target as HTMLElement).closest("button,a,aside")) return;
@@ -117,14 +126,11 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
       <div><span className="eyebrow">Research tree</span><h1>{project.goal ? "Following the question." : "Room for a good question."}</h1></div>
       <button className="canvas-knowledge" onClick={onKnowledge}>Shared knowledge <span>{data.claims.length + data.evidence.length + data.artifacts.length}</span><ChevronRight size={13} /></button>
     </div>
-    <div className="research-viewport" ref={viewport} tabIndex={0} aria-label="Research tree canvas. Drag to pan. Use plus and minus to zoom."
+    <div className="research-viewport" ref={viewport} tabIndex={0} aria-label="Research tree canvas. Drag to pan and scroll to zoom."
       onPointerDown={startPan}
       onPointerMove={event => { const drag = dragged.current; if (drag) setView(current => ({ ...current, x: drag.originX + event.clientX - drag.x, y: drag.originY + event.clientY - drag.y })); }}
       onPointerUp={() => { dragged.current = null; }} onPointerCancel={() => { dragged.current = null; }}
-      onWheel={event => {
-        if (event.ctrlKey || event.metaKey) zoomBy(event.deltaY < 0 ? 1.08 : 1 / 1.08);
-        else setView(current => ({ ...current, x: current.x - event.deltaX, y: current.y - event.deltaY }));
-      }}
+      onWheel={zoomWithWheel}
       onKeyDown={event => {
         if (event.target !== event.currentTarget) return;
         if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {

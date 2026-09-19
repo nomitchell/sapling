@@ -58,7 +58,7 @@ Execution permission and scientific cadence are separate.
 
 Approval records include the exact work order and requested capability categories. An approval cannot be reused for a different action or another project. Container experiments have CPU/memory/process/time limits, a read-only image, a writable experiment directory, and no network by default. Git metadata and captured logs live outside the directory mounted into experiments. Provider credentials are not inherited by experiment processes. GPU access can be requested as an experiment argument when the local Docker/GPU setup supports it.
 
-Lower cadence asks for more scientific input; higher cadence permits default scientific decisions. Cadence never overrides execution permissions or dollar reservations.
+Collaboration cadence has four choices: Collaborative, Balanced, Independent, and Autonomous. Lower cadence asks for more scientific input; higher cadence permits default scientific decisions. Cadence never overrides execution permissions or dollar reservations.
 
 ## Research runtime
 
@@ -76,7 +76,7 @@ Local code experiments materialize source in isolated directories, record Git sn
 
 ## Sources
 
-- [OpenAlex](https://help.openalex.org/api/): paper discovery, author/year/DOI/open-access metadata. Keyless requests work within the provider's allowance; a free key increases it.
+- [OpenAlex](https://help.openalex.org/api/): paper discovery, author/year/DOI/open-access metadata, and resolution to open full text. When a key is configured, paper reading prefers OpenAlex's cached machine-readable full text, then falls back to the best open-access host.
 - [SearXNG](https://docs.searxng.org/dev/search_api.html): preferred self-hosted general web search. Compose enables its JSON API.
 - [DDGS](https://github.com/deedy5/ddgs): no-key native fallback when SearXNG is unavailable. Results retain the actual provider and fallback reason. Upstream availability and rate limits vary.
 - Public HTML/PDF/text source opening saves original bytes, extracted text and retrieval provenance. Private/local sources can be uploaded explicitly. Authenticated private-service connectors are not yet included.

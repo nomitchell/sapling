@@ -51,6 +51,9 @@ def test_project_bootstrap_chat_and_isolation(app_client):
         project_state = tx.get("projects", p["id"])
         request = project_state["conversation_requests"][project_state["active_conversation_id"]]
         assert request["context_epoch"] == 0
+        assert request["max_model_calls"] == 24
+        assert request["max_tool_calls"] == 16
+        assert request["budget_total"] == 3
         assert tx.get("projects", p["id"])["control_epoch"] == 0
         assert len(tx.list("human_inputs", p["id"])) == 1
         assert len(tx.jobs(p["id"])) == 1

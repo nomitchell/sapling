@@ -514,7 +514,7 @@ async def test_new_tool_results_survive_context_limits(workspace):
 
 
 @pytest.mark.asyncio
-async def test_bounded_conversation_forces_synthesis_after_six_tools(workspace):
+async def test_bounded_conversation_forces_synthesis_after_tool_limit(workspace):
     from sapling.runtime import execute_work_order
 
     client, store, p, _ = workspace
@@ -529,7 +529,7 @@ async def test_bounded_conversation_forces_synthesis_after_six_tools(workspace):
 
     token = CURRENT_SCOPE.set(scope)
     try:
-        for index in range(6):
+        for index in range(16):
             await execute_work_order(
                 store,
                 h["id"],
@@ -554,7 +554,7 @@ async def test_bounded_conversation_forces_synthesis_after_six_tools(workspace):
             return {
                 "decision": schema(
                     response="Here is the bounded synthesis.",
-                    updated_summary="Six sources were checked.",
+                    updated_summary="The bounded source set was checked.",
                 ),
                 "usage": {},
                 "cost_usd": 0,
@@ -571,7 +571,7 @@ async def test_bounded_conversation_forces_synthesis_after_six_tools(workspace):
             "answer now from the available results, with source links and limitations. Do not "
             "request more tools or delegation."
         ),
-        "history": 6,
+        "history": 16,
     }
     assert result["status"] == "active"
     with store.transaction() as tx:

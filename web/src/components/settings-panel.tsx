@@ -350,19 +350,22 @@ export function SettingsPanel({
                 <select
                   aria-label="Collaboration"
                   value={
-                    config.cadence < 0.34
+                    config.cadence < 0.33
                       ? "0.2"
-                      : config.cadence > 0.66
-                        ? "0.8"
-                        : "0.5"
+                      : config.cadence < 0.58
+                        ? "0.45"
+                        : config.cadence < 0.82
+                          ? "0.7"
+                          : "0.9"
                   }
                   onChange={(event) =>
                     set("cadence", Number(event.target.value))
                   }
                 >
-                  <option value="0.2">Work closely together</option>
-                  <option value="0.5">Balanced</option>
-                  <option value="0.8">Continue independently</option>
+                  <option value="0.2">Collaborative</option>
+                  <option value="0.45">Balanced</option>
+                  <option value="0.7">Independent</option>
+                  <option value="0.9">Autonomous</option>
                 </select>
               </Row>
               <Row name="Research budget" hint="USD per project.">

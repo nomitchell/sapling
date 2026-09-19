@@ -5,6 +5,7 @@ import hashlib
 import io
 import ipaddress
 import json
+import re
 import socket
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from uuid import uuid4
+from xml.etree import ElementTree
 
 import httpx
 from bs4 import BeautifulSoup
@@ -116,7 +118,14 @@ def extract_text(data: bytes, content_type: str) -> tuple[str, str]:
         for element in soup(["script", "style", "noscript", "iframe", "svg"]):
             element.decompose()
         return title, soup.get_text("\n", strip=True)[:2_000_000]
-    if content_type.startswith("text/") or content_type in {"application/json", "application/xml"}:
+    if content_type in {"application/xml", "text/xml"}:
+        try:
+            root = ElementTree.fromstring(data)
+        except ElementTree.ParseError as exc:
+            raise SourceRejected("The source returned invalid XML.") from exc
+        text = "\n".join(part.strip() for part in root.itertext() if part.strip())
+        return "", text[:2_000_000]
+    if content_type.startswith("text/") or content_type == "application/json":
         return "", data.decode("utf-8", errors="replace")[:2_000_000]
     raise SourceRejected(f"Unsupported source content type: {content_type or 'unknown'}")
 
@@ -188,8 +197,10 @@ class SearchClient:
 
     async def search_literature(self, query: str, limit: int = 8) -> list[SearchResult]:
         query, limit = self._query(query, limit)
-        headers = {"Authorization": f"Bearer {self.openalex_api_key}"} if self.openalex_api_key else {}
-        payload = await self._json("https://api.openalex.org/works", params={"search": query, "per_page": limit}, headers=headers)
+        params = {"search": query, "per_page": limit}
+        if self.openalex_api_key:
+            params["api_key"] = self.openalex_api_key
+        payload = await self._json("https://api.openalex.org/works", params=params)
         results = []
         for work in payload.get("results", [])[:limit]:
             location = work.get("best_oa_location") or work.get("primary_location") or {}
@@ -202,6 +213,71 @@ class SearchClient:
                 open_access_url=location.get("pdf_url") or (work.get("open_access") or {}).get("oa_url"),
             ))
         return results
+
+    async def fetch_paper(self, query: str, destination_dir: str | Path) -> SourceArtifact:
+        """Resolve a paper through OpenAlex, preferring cached structured full text."""
+        query, _ = self._query(query, 1)
+        work_id = re.search(r"(?:openalex\.org/)?(W\d+)", query, re.IGNORECASE)
+        doi = re.search(r"10\.\d{4,9}/[^\s?#]+", query, re.IGNORECASE)
+        params: dict[str, object] = {}
+        if self.openalex_api_key:
+            params["api_key"] = self.openalex_api_key
+        if work_id:
+            work = await self._json(
+                f"https://api.openalex.org/works/{work_id.group(1).upper()}", params=params,
+            )
+        else:
+            if doi:
+                params["filter"] = f"doi:https://doi.org/{doi.group(0).rstrip('.,)')}"
+            else:
+                params["search.exact"] = f'"{query}"'
+            params["per_page"] = 10
+            payload = await self._json("https://api.openalex.org/works", params=params)
+            candidates = payload.get("results", [])
+            if not candidates:
+                if urlsplit(query).scheme in {"http", "https"}:
+                    return await self.fetch_source(query, destination_dir)
+                raise SearchUnavailable("OpenAlex could not resolve that paper. Search for its title or DOI first.")
+            if doi:
+                work = candidates[0]
+            else:
+                normalized_query = re.sub(r"[^\w]+", "", query.casefold())
+                work = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if re.sub(
+                            r"[^\w]+",
+                            "",
+                            str(candidate.get("display_name") or candidate.get("title") or "").casefold(),
+                        ) == normalized_query
+                    ),
+                    None,
+                )
+                if work is None:
+                    raise SearchUnavailable(
+                        "OpenAlex returned related works but no exact title match. Use a DOI, OpenAlex ID, or exact paper title."
+                    )
+
+        content_urls = work.get("content_urls") or {}
+        location = work.get("best_oa_location") or work.get("primary_location") or {}
+        cached_url = content_urls.get("grobid_xml") or content_urls.get("pdf")
+        open_url = location.get("pdf_url") or (work.get("open_access") or {}).get("oa_url")
+        if cached_url and self.openalex_api_key:
+            try:
+                return await self._fetch_source(
+                    cached_url, destination_dir, initial_params={"api_key": self.openalex_api_key},
+                )
+            except (httpx.HTTPError, SourceRejected, TimeoutError):
+                if not open_url:
+                    raise
+        if open_url:
+            return await self.fetch_source(open_url, destination_dir)
+        if cached_url:
+            return await self.fetch_source(cached_url, destination_dir)
+        raise SearchUnavailable(
+            "OpenAlex resolved the paper but did not expose an open full-text copy."
+        )
 
     async def search_web(self, query: str, limit: int = 8) -> list[SearchResult]:
         query, limit = self._query(query, limit)
@@ -254,13 +330,32 @@ class SearchClient:
         return results
 
     async def fetch_source(self, url: str, destination_dir: str | Path) -> SourceArtifact:
+        return await self._fetch_source(url, destination_dir)
+
+    async def _fetch_source(
+        self,
+        url: str,
+        destination_dir: str | Path,
+        *,
+        initial_params: dict[str, str] | None = None,
+    ) -> SourceArtifact:
         requested_url, current = url, url
         async with asyncio.timeout(self.timeout_seconds):
             for redirect in range(6):
                 current = await validate_public_url(current, self.resolver)
                 # Clear provider credentials/cookies. Never reuse authorization
                 # from search requests when opening an arbitrary public source.
-                async with self.client.stream("GET", current, follow_redirects=False, headers={"Accept": "text/html,application/pdf,text/plain;q=0.9", "Authorization": "", "Cookie": ""}) as response:
+                async with self.client.stream(
+                    "GET",
+                    current,
+                    follow_redirects=False,
+                    params=initial_params if redirect == 0 else None,
+                    headers={
+                        "Accept": "text/html,application/pdf,application/xml,text/plain;q=0.9",
+                        "Authorization": "",
+                        "Cookie": "",
+                    },
+                ) as response:
                     if response.status_code in {301, 302, 303, 307, 308}:
                         location = response.headers.get("location")
                         if redirect == 5 or not location:

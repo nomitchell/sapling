@@ -17,7 +17,7 @@ class ProjectSettings(BaseModel):
     provider: Literal["openai", "baseten"] = "openai"
     model: str = Field(default=DEFAULT_MODEL, min_length=1, max_length=120)
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = "low"
-    cadence: float = Field(default=0.5, ge=0, le=1)
+    cadence: float = Field(default=0.45, ge=0, le=1)
     budget_total: float = Field(default=10, ge=0, le=1000000)
     permission_mode: Literal["ask", "balanced", "yolo"] = "balanced"
     execution_backend: Literal["docker", "process"] = os.environ.get("SAPLING_EXECUTION_BACKEND", "docker")

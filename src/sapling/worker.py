@@ -330,6 +330,7 @@ class Worker:
             category = {
                 "search_literature": "search_web",
                 "search_web": "search_web",
+                "read_paper": "fetch_source",
                 "open_source": "fetch_source",
                 "read_artifact": "read_workspace",
                 "retrieve_evidence": "read_workspace",
@@ -402,13 +403,17 @@ class Worker:
                 },
             )
 
-        if kind in {"search_literature", "search_web", "open_source"}:
+        if kind in {"search_literature", "search_web", "read_paper", "open_source"}:
             async with SearchClient(
                 os.environ.get("SAPLING_SEARXNG_URL", "http://127.0.0.1:8088"), self.vault.get("openalex"),
                 tavily_api_key=self.vault.get("tavily"),
             ) as search:
-                if kind == "open_source":
-                    source = await search.fetch_source(args["url"], self.data_dir / "downloads")
+                if kind in {"read_paper", "open_source"}:
+                    source = (
+                        await search.fetch_paper(args["query"], self.data_dir / "downloads")
+                        if kind == "read_paper"
+                        else await search.fetch_source(args["url"], self.data_dir / "downloads")
+                    )
                     provenance = serialize(source)
                     provenance.pop("text", None)
                     raw = save_artifact(
@@ -436,7 +441,7 @@ class Worker:
                         "links": source.links,
                         "total_characters": len(source.text),
                         "next_offset": 2600 if len(source.text) > 2600 else None,
-                        "reading_hint": "This is an excerpt. Read artifact_id with query for a section or next_offset for the next passage. An abstract page is not the full paper; open its PDF/HTML link.",
+                        "reading_hint": "This is an excerpt. Read artifact_id with query for a section or next_offset for the next passage. Paper-reading results are full-text artifacts when an open copy is available.",
                         "cost_usd": 0,
                         "evidence": [
                             {

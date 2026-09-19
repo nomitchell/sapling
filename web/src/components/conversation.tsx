@@ -623,6 +623,7 @@ function toolLabel(event: ResearchEvent) {
       {
         search_literature: "Searching papers",
         search_web: "Searching the web",
+        read_paper: "Reading a paper",
         open_source: "Reading a source",
         run_experiment: "Running an experiment",
         read_artifact: "Reading an artifact",

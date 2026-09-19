@@ -101,14 +101,19 @@ def record_conversation(tx, project, text, node_ids=None, attention_ids=None):
         requests = dict(project.get("conversation_requests", {}))
         available = max(0, project["budget_total"] - project.get("budget_spent", 0) - project.get("budget_reserved", 0))
         requests[request_id] = {"id": request_id, "state": "active", "control_epoch": 0,
-            "context_epoch": 0, "budget_total": min(1.0, available), "budget_spent": 0,
-            "budget_reserved": 0, "model_calls": 0, "max_model_calls": 10,
-            "tool_calls": 0, "max_tool_calls": 6, "tool_history": [],
+            "context_epoch": 0, "budget_total": min(3.0, available), "budget_spent": 0,
+            "budget_reserved": 0, "model_calls": 0, "max_model_calls": 24,
+            "tool_calls": 0, "max_tool_calls": 16, "tool_history": [],
             "latest_human_input_id": human["id"]}
         tx.update("projects", pid, {"active_conversation_id": request_id, "conversation_requests": requests})
     else:
         update_request(tx, pid, "conversation:" + request_id, {
-            "latest_human_input_id": human["id"], "context_epoch": request.get("context_epoch", 0) + 1})
+            "latest_human_input_id": human["id"],
+            "context_epoch": request.get("context_epoch", 0) + 1,
+            "budget_total": max(request.get("budget_total", 0), min(3.0, project["budget_total"])),
+            "max_model_calls": max(request.get("max_model_calls", 0), 24),
+            "max_tool_calls": max(request.get("max_tool_calls", 0), 16),
+        })
     message = tx.create("messages", {"project_id": pid, "role": "user", "text": text,
         "human_input_id": human["id"], "node_ids": node_ids, "attention_ids": attention_ids,
         "work_scope": "conversation:" + request_id})

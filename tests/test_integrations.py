@@ -116,6 +116,46 @@ async def test_search_protocols_and_missing_service():
             await SearchClient(client=client, native_fallback=False).search_web("query")
 
 
+@pytest.mark.asyncio
+async def test_paper_reader_prefers_openalex_full_text_without_persisting_key(tmp_path):
+    async def handler(request):
+        if request.url.host == "api.openalex.org":
+            assert request.url.params["search.exact"] == '"A useful paper"'
+            assert request.url.params["api_key"] == "test-openalex-key"
+            return httpx.Response(200, json={"results": [
+                {
+                    "id": "https://openalex.org/W999",
+                    "display_name": "A related but different paper",
+                },
+                {
+                    "id": "https://openalex.org/W123",
+                    "display_name": "A useful paper",
+                    "content_urls": {
+                        "grobid_xml": "https://content.openalex.org/works/W123.grobid-xml",
+                    },
+                    "best_oa_location": {"pdf_url": "https://arxiv.org/pdf/1234.5678"},
+                },
+            ]})
+        assert request.url.host == "content.openalex.org"
+        assert request.url.params["api_key"] == "test-openalex-key"
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/xml"},
+            content=b"<article><title>Useful</title><p>Full experimental results.</p></article>",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        search = SearchClient(
+            openalex_api_key="test-openalex-key", client=client, resolver=public_resolver,
+        )
+        paper = await search.fetch_paper("A useful paper", tmp_path)
+
+    assert "Full experimental results." in paper.text
+    assert "test-openalex-key" not in paper.requested_url
+    assert "test-openalex-key" not in paper.final_url
+    assert "test-openalex-key" not in Path(paper.metadata_path).read_text()
+
+
 class StrictDecision(BaseModel):
     summary: str
 

@@ -17,7 +17,7 @@ export type ResearchSettings = {
 };
 
 export const defaults: ResearchSettings = {
-  provider: "openai", model: "gpt-5.4-nano", reasoning_effort: "low", cadence: 0.5,
+  provider: "openai", model: "gpt-5.4-nano", reasoning_effort: "low", cadence: 0.45,
   budget_total: 10, permission_mode: "balanced", execution_backend: "docker",
   max_concurrent_holons: 4, max_depth: null, experiment_timeout: 300,
   max_output_tokens: 8192, max_turn_cost_usd: 1,

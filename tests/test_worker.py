@@ -121,6 +121,43 @@ def test_orphaned_active_conversation_is_requeued_after_restart(worker_app):
     assert any(item["type"] == "ORPHANED_TURN_RECOVERED" for item in events)
 
 
+def test_blocked_conversation_without_attention_is_normalized_to_a_handoff(worker_app):
+    _, store, worker, _ = worker_app
+    project, holon = create_project(worker_app)
+    with store.transaction() as tx:
+        tx.cancel_queued(holon["id"])
+        tx.update(
+            "projects",
+            project["id"],
+            {
+                "active_conversation_id": "blocked",
+                "conversation_requests": {
+                    "blocked": {
+                        "id": "blocked", "state": "active", "budget_total": 1,
+                        "budget_spent": 0, "budget_reserved": 0, "model_calls": 0,
+                        "max_model_calls": 48, "tool_calls": 0, "max_tool_calls": 32,
+                    }
+                },
+            },
+        )
+        child = tx.create(
+            "holons",
+            {**holon, "id": "blocked-child", "parent_id": holon["id"], "status": "blocked",
+             "work_scope": "conversation:blocked", "assigned_node_id": "blocked-node",
+             "summary": "Search was inconclusive.", "budget_remaining": 0},
+        )
+        root_node = tx.get("research_nodes", holon["assigned_node_id"])
+        tx.create(
+            "research_nodes",
+            {**root_node, "id": "blocked-node", "owning_holon_id": child["id"],
+             "parent_node_id": root_node["id"], "status": "active"},
+        )
+    worker._recover_orphaned_turns()
+    with store.transaction() as tx:
+        assert tx.get("holons", child["id"])["status"] == "completed"
+        assert any(item["type"] == "CONVERSATION_BLOCK_NORMALIZED" for item in tx.history(project["id"]))
+
+
 @pytest.mark.asyncio
 async def test_baseten_rate_limit_retries_before_the_turn_fails(worker_app, monkeypatch):
     _, store, worker, _ = worker_app

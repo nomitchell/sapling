@@ -2350,7 +2350,23 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
             if hid == project.get("root_holon_id") and conversation_request(project):
                 pass  # The root remains available; its request closes after children finish.
             else:
-                _complete(tx, project, holon, decision.completion)
+                completion = decision.completion
+                if (
+                    request
+                    and hid != project.get("root_holon_id")
+                    and completion.outcome == "blocked"
+                    and not any(
+                        item.get("holon_id") == hid and item.get("status") == "pending"
+                        for item in tx.list("attention_items", project_id=pid)
+                    )
+                ):
+                    # A bounded conversational researcher often uses
+                    # "blocked" to report a limitation. A real pause is
+                    # represented by a pending attention item; without one,
+                    # retain the limitation in the handoff and let the parent
+                    # continue rather than strand the whole conversation.
+                    completion = completion.model_copy(update={"outcome": "unproductive"})
+                _complete(tx, project, holon, completion)
         elif (
             request
             and hid != project.get("root_holon_id")

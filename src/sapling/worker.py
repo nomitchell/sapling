@@ -111,7 +111,7 @@ class Worker:
         its next queued turn. The normal decision path maintains the same
         invariant, while this sweep repairs older projects and restarts.
         """
-        from .runtime import conversation_request
+        from .runtime import HolonCompletion, _complete, conversation_request
 
         with self.store.transaction() as tx:
             for project in tx.list("projects"):
@@ -123,6 +123,31 @@ class Worker:
                     for job in jobs
                     if job.get("state") in {"queued", "running"}
                 }
+                # Before this invariant existed, conversational workers could
+                # persist a model-reported "blocked" outcome without an
+                # attention item. It is a finding with a limitation, not a
+                # human pause, so normalize it into a terminal handoff.
+                for holon in tx.list("holons", project_id=project["id"], status="blocked"):
+                    scope = holon.get("work_scope") or "research"
+                    request = conversation_request(project, scope)
+                    has_attention = any(
+                        item.get("holon_id") == holon["id"] and item.get("status") == "pending"
+                        for item in tx.list("attention_items", project_id=project["id"])
+                    )
+                    if (
+                        holon["id"] != project.get("root_holon_id")
+                        and request is not None
+                        and request.get("state") == "active"
+                        and not holon.get("blocked_reason")
+                        and not has_attention
+                    ):
+                        _complete(
+                            tx,
+                            project,
+                            holon,
+                            HolonCompletion(summary=holon.get("summary") or "Worker stopped with a reported limitation.", outcome="unproductive"),
+                        )
+                        tx.event(project["id"], "CONVERSATION_BLOCK_NORMALIZED", {"holon_id": holon["id"]})
                 for holon in tx.list("holons", project_id=project["id"], status="active"):
                     scope = holon.get("work_scope") or "research"
                     if holon["id"] == project.get("root_holon_id"):

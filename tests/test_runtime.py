@@ -266,6 +266,20 @@ def test_summary_only_conversation_worker_hands_off_and_wakes_parent(store):
     assert any(job["holon_id"] == "h" and job["kind"] == "turn" for job in queued)
 
 
+def test_blocked_conversation_completion_without_attention_becomes_a_handoff(store):
+    add_child(store, "a", "na")
+    activate_conversation(store)
+    with store.transaction() as tx:
+        tx.update("holons", "a", {"work_scope": "conversation:bounded"})
+    token = CURRENT_SCOPE.set("conversation:bounded")
+    try:
+        apply(store, decision(completion={"summary": "The source is unavailable.", "outcome": "blocked"}), "a")
+    finally:
+        CURRENT_SCOPE.reset(token)
+    assert get(store, "holons", "a")["status"] == "completed"
+    assert get(store, "research_nodes", "na")["status"] == "abandoned"
+
+
 def test_branch_only_conversation_worker_gets_one_repair_then_hands_off(store):
     add_child(store, "a", "na")
     activate_conversation(store)

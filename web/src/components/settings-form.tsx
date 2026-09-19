@@ -10,6 +10,7 @@ export function SettingsForm({ value, onChange, compact = false }: { value: Rese
   const [catalog, setCatalog] = useState<ModelCatalog>(fallbackModelCatalog);
   const [custom, setCustom] = useState(false);
   const [catalogError, setCatalogError] = useState(false);
+  const [pricingOpen, setPricingOpen] = useState(false);
   const selected = catalog.models.find(model => model.id === value.model);
   const usingCustom = custom || (!!value.model && !selected);
   const efforts = selected?.reasoning_efforts || Object.keys(reasoningLabels);
@@ -31,6 +32,19 @@ export function SettingsForm({ value, onChange, compact = false }: { value: Rese
     onChange({ ...value, model: next.id, reasoning_effort: effort, input_cost_per_million: next.input_cost_per_million, output_cost_per_million: next.output_cost_per_million, cached_input_cost_per_million: next.cached_input_cost_per_million ?? null });
   }
 
+  function changeCustomIdentifier(id: string) {
+    if (id === value.model) return;
+    const known = catalog.models.find(model => model.id === id);
+    if (known) {
+      chooseModel(id);
+      setCustom(true);
+      return;
+    }
+    onChange({ ...value, model: id, reasoning_effort: null, input_cost_per_million: 0, output_cost_per_million: 0, cached_input_cost_per_million: null });
+  }
+  const customPricingNeeded = usingCustom && !selected && (value.input_cost_per_million <= 0 || value.output_cost_per_million <= 0);
+  useEffect(() => { if (customPricingNeeded) setPricingOpen(true); }, [customPricingNeeded]);
+
   return <div className="settings-fields">
     <div className="form-section-title"><span>01</span> Intelligence</div>
     <label>Model
@@ -41,7 +55,8 @@ export function SettingsForm({ value, onChange, compact = false }: { value: Rese
       </select>
       <small>{selected ? "Rates fill automatically when you choose a listed model. You can adjust them under advanced pricing." : "Use an exact model identifier available to your OpenAI account."}</small>
     </label>
-    {usingCustom && <label>Custom model identifier<input aria-label="Custom model identifier" value={value.model} onChange={event => onChange({ ...value, model: event.target.value, reasoning_effort: null, cached_input_cost_per_million: null })} placeholder="Enter an OpenAI model ID" autoComplete="off" /><small>Set compatible reasoning and token prices for your custom model below.</small></label>}
+    {usingCustom && <label>Custom model identifier<input aria-label="Custom model identifier" value={value.model} onChange={event => changeCustomIdentifier(event.target.value)} placeholder="Enter an OpenAI model ID" autoComplete="off" /><small>Set compatible reasoning and token prices for your custom model below.</small></label>}
+    {customPricingNeeded && <p className="field-note model-pricing-needed" role="status">Add this model&apos;s input and output prices under advanced pricing. Research requires both prices before it can run.</p>}
     {catalogError && <p className="field-note model-catalog-note">The live model catalog is unavailable. Saved model choices are shown.</p>}
     <div className="form-grid">
       <label>Reasoning effort<select aria-label="Reasoning effort" value={effectiveEffort} onChange={event => set("reasoning_effort", event.target.value === "__model_default__" ? null : event.target.value)}>{!selected && <option value="__model_default__">Model default</option>}{efforts.map(effort => <option key={effort} value={effort}>{reasoningLabels[effort] || effort}</option>)}</select><small>{selected ? "Higher effort may use more time and tokens." : "Choose Model default when your model does not support reasoning controls."}</small></label>
@@ -61,7 +76,7 @@ export function SettingsForm({ value, onChange, compact = false }: { value: Rese
     </>}
     <div className="form-section-title"><span>{compact ? "03" : "04"}</span> Cost estimates</div>
     <div className="pricing-summary"><span>Per million tokens</span><strong>{"$" + value.input_cost_per_million.toFixed(2)} input <span>/</span> {"$" + value.output_cost_per_million.toFixed(2)} output</strong></div>
-    <details className="advanced-pricing">
+    <details className="advanced-pricing" open={pricingOpen} onToggle={event => setPricingOpen(event.currentTarget.open)}>
       <summary>Advanced pricing</summary>
       <p className="field-note">Rates estimate model usage in USD. Other service charges are excluded. Verify custom rates against your provider plan.</p>
       <div className="form-grid"><label>Input / million tokens ($)<input type="number" min="0" step="0.001" value={value.input_cost_per_million} onChange={event => set("input_cost_per_million", Number(event.target.value))} /></label><label>Output / million tokens ($)<input type="number" min="0" step="0.001" value={value.output_cost_per_million} onChange={event => set("output_cost_per_million", Number(event.target.value))} /></label></div>

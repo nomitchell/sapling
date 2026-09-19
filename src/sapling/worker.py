@@ -286,13 +286,34 @@ class Worker:
                 )
                 error.cost_usd = 0
                 raise error
-            result = await model.turn(
-                context,
-                schema,
-                instructions,
-                max_output_tokens=min(output_limit, affordable),
-                progress=config.get("_progress_callback"),
-            )
+            from openai import RateLimitError
+
+            for attempt in range(6):
+                try:
+                    result = await model.turn(
+                        context,
+                        schema,
+                        instructions,
+                        max_output_tokens=min(output_limit, affordable),
+                        progress=config.get("_progress_callback"),
+                    )
+                    break
+                except RateLimitError:
+                    if settings.get("provider") != "baseten" or attempt == 5:
+                        raise
+                    delay_seconds = 2**attempt
+                    with self.store.transaction() as tx:
+                        tx.event(
+                            project["id"],
+                            "MODEL_RATE_LIMIT_RETRY",
+                            {
+                                "holon_id": holon["id"],
+                                "provider": "baseten",
+                                "attempt": attempt + 1,
+                                "delay_seconds": delay_seconds,
+                            },
+                        )
+                    await asyncio.sleep(delay_seconds)
             return {
                 "decision": result.decision.model_dump(mode="json"),
                 "usage": result.usage,

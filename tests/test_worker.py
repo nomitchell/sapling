@@ -6,10 +6,12 @@ import shutil
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from sapling.api import create_app
+from sapling.runtime import HolonCompletion, HolonDecision
 from sapling.store import Store
 from sapling.worker import Worker, save_artifact
 
@@ -17,6 +19,11 @@ from sapling.worker import Worker, save_artifact
 class EmptyVault:
     def get(self, provider):
         return None
+
+
+class ConfiguredVault:
+    def get(self, provider):
+        return "bt-test-key" if provider == "baseten" else None
 
 
 @pytest.fixture
@@ -79,6 +86,53 @@ async def test_missing_key_preserves_human_input_and_creates_one_configuration_a
         assert tx.get("projects", project["id"])["budget_spent"] == 0
         assert not tx.list("experiments", project["id"])
         assert any(event["type"] == "ATTENTION_CREATED" for event in tx.history(project["id"]))
+
+
+@pytest.mark.asyncio
+async def test_baseten_rate_limit_retries_before_the_turn_fails(worker_app, monkeypatch):
+    _, store, worker, _ = worker_app
+    worker.vault = ConfiguredVault()
+    project, holon = create_project(
+        worker_app,
+        provider="baseten",
+        model="zai-org/GLM-5.3-Flash",
+        reasoning_effort="high",
+    )
+    calls, sleeps = [], []
+
+    class RetryModel:
+        async def turn(self, *args, **kwargs):
+            calls.append(kwargs["max_output_tokens"])
+            if len(calls) == 1:
+                request = httpx.Request("POST", "https://inference.baseten.co/v1/chat/completions")
+                from openai import RateLimitError
+                raise RateLimitError("rate limited", response=httpx.Response(429, request=request), body=None)
+            return type("Turn", (), {
+                "decision": HolonDecision(
+                    updated_summary="Recovered after provider backoff.",
+                    completion=HolonCompletion(summary="No further work needed."),
+                ),
+                "usage": {"input_tokens": 10, "output_tokens": 10, "cached_input_tokens": 0},
+                "cost_usd": 0.00001,
+                "response_id": "retry-test",
+            })()
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("sapling.integrations.model.model_runtime", lambda *args, **kwargs: RetryModel())
+
+    async def no_wait(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr("sapling.worker.asyncio.sleep", no_wait)
+    await worker.perform(job(project, holon))
+
+    assert len(calls) == 2
+    assert sleeps == [1]
+    with store.transaction() as tx:
+        events = tx.history(project["id"])
+    assert any(event["type"] == "MODEL_RATE_LIMIT_RETRY" for event in events)
 
 
 @pytest.mark.asyncio

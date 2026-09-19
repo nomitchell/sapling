@@ -231,22 +231,16 @@ def test_progressive_widening_rolls_back_entire_decision(store):
     assert not rows(store, "decision_snapshots")
 
 
-def test_stale_values_require_reassessment_before_allocation(store):
+def test_stale_values_are_refreshed_before_allocation(store):
     with store.transaction() as tx:
         tx.update("projects", "p", {"evidence_epoch": 2})
-    with pytest.raises(RuntimeRejected, match="stale"):
-        apply(store, decision(work_orders=[work()]))
     applied = apply(
         store,
-        decision(
-            node_assessments=[
-                {"node_id": "n", "value": 0.6, "confidence": 0.7, "reasoning": "Changed evidence"}
-            ],
-            work_orders=[work()],
-        ),
+        decision(work_orders=[work()]),
     )
     assert applied["work_order"]["node_id"] == "n"
     assert get(store, "research_nodes", "n")["evidence_epoch"] == 2
+    assert "STALE_FRONTIER_REFRESHED" in event_types(store)
 
 
 def test_concrete_work_takes_precedence_over_conflicting_completion(store):
@@ -262,20 +256,18 @@ def test_concrete_work_takes_precedence_over_conflicting_completion(store):
 
 
 @pytest.mark.asyncio
-async def test_stale_allocation_gets_one_repair_without_executing_work(store):
+async def test_stale_allocation_refreshes_then_executes_work(store):
     with store.transaction() as tx:
         tx.update("projects", "p", {"evidence_epoch": 2})
     async def model(context, schema, settings):
         return {"decision": decision(work_orders=[work()]).model_dump(), "cost_usd": 0.001}
     async def dispatch(*args):
-        pytest.fail("Invalid work must never execute")
-    assert (await run_turn(store, "h", model, dispatch))["status"] == "retrying"
-    assert "node_assessments" in get(store, "holons", "h")["runtime_feedback"]
-    assert (await run_turn(store, "h", model, dispatch))["status"] == "rejected"
+        return {"summary": "Fresh result", "cost_usd": 0}
+    assert (await run_turn(store, "h", model, dispatch))["status"] == "active"
 
 
 @pytest.mark.asyncio
-async def test_invalid_runtime_reference_gets_one_bounded_repair(store):
+async def test_invalid_runtime_reference_gets_three_bounded_repairs(store):
     async def model(context, schema, settings):
         return {
             "decision": decision(
@@ -292,8 +284,9 @@ async def test_invalid_runtime_reference_gets_one_bounded_repair(store):
     first = await run_turn(store, "h", model, dispatch)
     assert first["status"] == "retrying"
     assert "invented-node" in get(store, "holons", "h")["runtime_feedback"]
-    second = await run_turn(store, "h", model, dispatch)
-    assert second["status"] == "rejected"
+    assert (await run_turn(store, "h", model, dispatch))["status"] == "retrying"
+    assert (await run_turn(store, "h", model, dispatch))["status"] == "retrying"
+    assert (await run_turn(store, "h", model, dispatch))["status"] == "rejected"
 
 
 def test_recursive_delegation_conserves_money_and_returns_unused_budget(store):
@@ -972,16 +965,19 @@ async def test_nonempirical_reasoning_is_not_routed_as_shared_observation(store)
     assert result["status"] == "local_interpretation"
 
 
-async def test_tool_reported_failure_stops_rescheduling(store):
+async def test_tool_reported_failure_recovers_in_continuous_research(store):
+    from sapling.integrations.search import SearchUnavailable
+
     async def model(*args):
         return {"decision": decision(work_orders=[work()]).model_dump(), "cost_usd": 0.1}
 
     async def dispatch(*args):
-        return {"status": "error", "summary": "Unavailable service", "cost_usd": 0}
+        raise SearchUnavailable("Unavailable service")
 
     result = await run_turn(store, "h", model, dispatch)
-    assert result["status"] == "blocked"
+    assert result["status"] == "active"
     assert get(store, "research_nodes", "n")["visits"] == 0
+    assert "different discovery route" in get(store, "holons", "h")["runtime_feedback"]
 
 
 def test_attention_carries_snapshot_for_real_human_preference_records(store):

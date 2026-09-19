@@ -2052,7 +2052,22 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
             and (n.get("value_estimate") is None or n.get("evidence_epoch", -1) != epoch)
         ]
         if stale and not conversation_request(project):
-            raise RuntimeRejected("Visible stale branch values must be reassessed before allocation")
+            # Evidence invalidates confidence, not the worker's lease. Refresh
+            # the estimates transactionally and let scheduling continue.
+            for node in stale:
+                tx.update(
+                    "research_nodes",
+                    node["id"],
+                    {
+                        "evidence_epoch": epoch,
+                        "value_confidence": float(node.get("value_confidence") or 0) * 0.85,
+                    },
+                )
+            tx.event(
+                pid,
+                "STALE_FRONTIER_REFRESHED",
+                {"holon_id": hid, "node_ids": [node["id"] for node in stale], "evidence_epoch": epoch},
+            )
     candidate_actions = [
         {
             "node_id": n["id"],
@@ -2221,8 +2236,8 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 for h in tx.list("holons", project_id=pid)
                 if h.get("status") in {"active", "awaiting_permission", "paused"}
             ]
-            if len(active_holons) >= int(settings.get("max_holons", 32)):
-                raise RuntimeRejected("Maximum project holon count reached")
+            if len(active_holons) >= int(settings.get("max_concurrent_holons", 4)):
+                raise RuntimeRejected("Maximum concurrent researcher limit reached")
             if node.get("delegated_holon_id"):
                 raise RuntimeRejected("Research node already has a delegate")
             group = f"{hid}:{request.independence_group}" if request.independence_group else None
@@ -2746,25 +2761,31 @@ async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *
         with store.transaction() as tx:
             project, holon = tx.get("projects", pid), _owned(tx, "holons", holon_id, pid)
             tx.event(pid, "DECISION_REJECTED", {"holon_id": holon_id, "reason": str(exc)[:1200]})
-            if (str(exc) == "Visible stale branch values must be reassessed before allocation"
-                and not holon.get("decision_retry_count") and _runnable(tx, project, holon)):
-                tx.update("holons", holon_id, {"decision_retry_count": 1, "runtime_feedback":
-                    "Your proposed work did not execute. Reassess every stale local frontier node "
-                    "using node_assessments before requesting the next work_order. Inspect frontier stale flags."})
-                tx.enqueue(pid, holon_id, "turn", {"reason": "reassess_stale_values"})
-                return {"status": "retrying", "cost_usd": cost, "usage": usage}
-            if not holon.get("decision_retry_count") and _runnable(tx, project, holon):
+            repair_attempt = int(holon.get("decision_retry_count", 0))
+            if repair_attempt < 3 and _runnable(tx, project, holon):
+                executable_nodes = [
+                    node["id"]
+                    for node in _frontier(tx, holon)
+                    if node.get("owning_holon_id") == holon_id
+                    and not node.get("delegated_holon_id")
+                ]
                 tx.update(
                     "holons",
                     holon_id,
                     {
-                        "decision_retry_count": 1,
+                        "decision_retry_count": repair_attempt + 1,
                         "runtime_feedback": (
                             "Your last decision was not executed because it violated this runtime "
-                            f"constraint: {str(exc)[:600]}. Use only IDs present in the current "
-                            "context, preserve ownership and scope, and return one corrected decision."
+                            f"constraint: {str(exc)[:600]}. The executable nodes in your current "
+                            f"lease are {executable_nodes}. Use only those IDs for work or delegation, "
+                            "preserve ownership and scope, and return one corrected decision."
                         ),
                     },
+                )
+                tx.event(
+                    pid,
+                    "RUNTIME_DECISION_REPAIR_QUEUED",
+                    {"holon_id": holon_id, "attempt": repair_attempt + 1, "reason": str(exc)[:600]},
                 )
                 tx.enqueue(pid, holon_id, "turn", {"reason": "repair_runtime_constraint"})
                 return {"status": "retrying", "cost_usd": cost, "usage": usage}
@@ -2934,7 +2955,6 @@ async def execute_work_order(store: Any, holon_id: str, work_order: dict, tool_d
             project, holon = tx.get("projects", pid), _owned(tx, "holons", holon_id, pid)
             recoverable = bool(
                 not isinstance(exc, asyncio.CancelledError)
-                and conversation_request(project, work_scope(holon))
                 and work_order["kind"]
                 in {
                     "search_literature",

@@ -215,7 +215,7 @@ class SearchClient:
         return results
 
     async def fetch_paper(self, query: str, destination_dir: str | Path) -> SourceArtifact:
-        """Resolve a paper through OpenAlex, preferring cached structured full text."""
+        """Resolve a paper through OpenAlex with open-source fallbacks."""
         query, _ = self._query(query, 1)
         work_id = re.search(r"(?:openalex\.org/)?(W\d+)", query, re.IGNORECASE)
         doi = re.search(r"10\.\d{4,9}/[^\s?#]+", query, re.IGNORECASE)
@@ -255,28 +255,66 @@ class SearchClient:
                     None,
                 )
                 if work is None:
-                    raise SearchUnavailable(
-                        "OpenAlex returned related works but no exact title match. Use a DOI, OpenAlex ID, or exact paper title."
+                    # A title plus author or year is a useful and common
+                    # reading request. Choose only a strong lexical match,
+                    # never an arbitrary search result.
+                    query_words = set(re.findall(r"[a-z0-9]{3,}", query.casefold()))
+                    ranked = sorted(
+                        candidates,
+                        key=lambda candidate: len(
+                            query_words
+                            & set(re.findall(
+                                r"[a-z0-9]{3,}",
+                                str(candidate.get("display_name") or candidate.get("title") or "").casefold(),
+                            ))
+                        ),
+                        reverse=True,
                     )
+                    best = ranked[0] if ranked else None
+                    overlap = len(query_words & set(re.findall(
+                        r"[a-z0-9]{3,}",
+                        str((best or {}).get("display_name") or (best or {}).get("title") or "").casefold(),
+                    )))
+                    if not best or overlap < max(2, min(4, len(query_words) - 1)):
+                        raise SearchUnavailable(
+                            "OpenAlex returned related works but no sufficiently close title match. Use a DOI, OpenAlex ID, or exact paper title."
+                        )
+                    work = best
 
         content_urls = work.get("content_urls") or {}
-        location = work.get("best_oa_location") or work.get("primary_location") or {}
-        cached_url = content_urls.get("grobid_xml") or content_urls.get("pdf")
-        open_url = location.get("pdf_url") or (work.get("open_access") or {}).get("oa_url")
-        if cached_url and self.openalex_api_key:
+        primary = work.get("best_oa_location") or work.get("primary_location") or {}
+        candidates: list[tuple[str, dict[str, str] | None]] = []
+        if content_urls.get("grobid_xml") and self.openalex_api_key:
+            candidates.append((content_urls["grobid_xml"], {"api_key": self.openalex_api_key}))
+        for url in (
+            content_urls.get("pdf"),
+            primary.get("pdf_url"),
+            (work.get("open_access") or {}).get("oa_url"),
+            primary.get("landing_page_url"),
+        ):
+            if url:
+                candidates.append((url, None))
+        for location in work.get("locations") or []:
+            if not isinstance(location, dict):
+                continue
+            for url in (location.get("pdf_url"), location.get("landing_page_url")):
+                if url:
+                    candidates.append((url, None))
+
+        seen, failures = set(), []
+        for url, initial_params in candidates:
+            if url in seen:
+                continue
+            seen.add(url)
             try:
                 return await self._fetch_source(
-                    cached_url, destination_dir, initial_params={"api_key": self.openalex_api_key},
+                    url, destination_dir, initial_params=initial_params,
                 )
-            except (httpx.HTTPError, SourceRejected, TimeoutError):
-                if not open_url:
-                    raise
-        if open_url:
-            return await self.fetch_source(open_url, destination_dir)
-        if cached_url:
-            return await self.fetch_source(cached_url, destination_dir)
+            except (httpx.HTTPError, SourceRejected, TimeoutError, ValueError) as exc:
+                failures.append(type(exc).__name__)
+        detail = ", ".join(sorted(set(failures))) or "no public source URL"
         raise SearchUnavailable(
-            "OpenAlex resolved the paper but did not expose an open full-text copy."
+            f"OpenAlex resolved the paper but none of its open full-text routes worked ({detail})."
         )
 
     async def search_web(self, query: str, limit: int = 8) -> list[SearchResult]:

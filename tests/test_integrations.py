@@ -165,6 +165,35 @@ async def test_paper_reader_prefers_openalex_full_text_without_persisting_key(tm
     assert "test-openalex-key" not in Path(paper.metadata_path).read_text()
 
 
+@pytest.mark.asyncio
+async def test_paper_reader_uses_close_title_and_open_access_fallback(tmp_path):
+    async def handler(request):
+        if request.url.host == "api.openalex.org":
+            return httpx.Response(200, json={"results": [{
+                "id": "https://openalex.org/W321",
+                "display_name": "Improving Robustness Using Generated Data",
+                "best_oa_location": {"pdf_url": "https://unavailable.example/paper.pdf"},
+                "open_access": {"oa_url": "https://arxiv.org/html/2102.09425"},
+            }]})
+        if request.url.host == "unavailable.example":
+            return httpx.Response(503)
+        assert request.url.host == "arxiv.org"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"<html><title>Generated Data</title><body>Full ablation results.</body></html>",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        search = SearchClient(client=client, resolver=public_resolver)
+        paper = await search.fetch_paper(
+            "Improving Robustness Using Generated Data Gowal 2021", tmp_path,
+        )
+
+    assert paper.final_url == "https://arxiv.org/html/2102.09425"
+    assert "Full ablation results." in paper.text
+
+
 class StrictDecision(BaseModel):
     summary: str
 

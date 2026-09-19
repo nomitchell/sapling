@@ -8,12 +8,21 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-
-
 from pydantic import BaseModel
 
-from sapling.integrations.execution import LocalDockerBackend, LocalProcessBackend, WorkspaceViolation, contained_path, sanitized_environment
-from sapling.integrations.model import MissingCredential, ModelResponseError, OpenAIModelRuntime
+from sapling.integrations.execution import (
+    LocalDockerBackend,
+    LocalProcessBackend,
+    WorkspaceViolation,
+    contained_path,
+    sanitized_environment,
+)
+from sapling.integrations.model import (
+    MissingCredential,
+    ModelResponseError,
+    OpenAIModelRuntime,
+    partial_json_string_field,
+)
 from sapling.integrations.permissions import PermissionPolicy
 from sapling.integrations.search import SearchClient, SearchUnavailable, SourceRejected, validate_public_url
 
@@ -162,6 +171,14 @@ class StrictDecision(BaseModel):
 
 class FlexibleDecision(BaseModel):
     arguments: dict
+
+
+def test_partial_json_response_stream_exposes_only_public_field():
+    partial = '{"updated_summary":"private planning","response":"Hello\\n**research'
+    assert partial_json_string_field(partial, "response") == "Hello\n**research"
+    assert partial_json_string_field('{"updated_summary":"contains \\\"response\\\": \\\"secret\\\""', "response") is None
+    assert partial_json_string_field('{"response":null,"updated_summary":"private"}', "response") is None
+    assert partial_json_string_field('{"response":"hi \\u26', "response") == "hi "
 
 
 @pytest.mark.asyncio

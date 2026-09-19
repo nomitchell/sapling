@@ -71,10 +71,12 @@ export function Conversation({
   const [stopping, setStopping] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [streamedResponse, setStreamedResponse] = useState("");
   const [atBottom, setAtBottom] = useState(true);
   const file = useRef<HTMLInputElement>(null);
   const scroll = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
+  const streamedResponseRef = useRef("");
   const root = data.holarchy.find((item) => item.id === project.root_holon_id);
   const jobs = (
     Array.isArray(data.stats.jobs) ? data.stats.jobs : []
@@ -101,8 +103,16 @@ export function Conversation({
       (event) =>
         event.type === "HUMAN_INPUT" || event.type === "CONVERSATION_RETRIED",
     );
+  const latestUserMessage = [...data.messages]
+    .reverse()
+    .find(message => message.role === "user" && message.channel !== "progress");
+  const awaitingInputEvent = Boolean(
+    latestUserMessage &&
+    (!lastInput || new Date(latestUserMessage.created_at).getTime() > new Date(lastInput.created_at).getTime()),
+  );
   const turnEvents = data.events.filter(
     (event) =>
+      !awaitingInputEvent &&
       (!lastInput || Number(event.id) > Number(lastInput.id)) &&
       event.payload.holon_id === project.root_holon_id,
   );
@@ -131,24 +141,46 @@ export function Conversation({
         event.type === "MODEL_STREAM" &&
         !completedStreams.has(String(event.payload.stream_id || "")),
     );
-  const usage = turnEvents.reduce(
-    (total, event) => {
-      if (event.type !== "MODEL_TURN") return total;
+  const latestStream = [...turnEvents]
+    .reverse()
+    .find((event) => event.type === "MODEL_STREAM");
+  const latestAssistantMessage = [...data.messages]
+    .reverse()
+    .find(message => message.role === "assistant" && message.channel !== "progress");
+  const awaitingAnswer = Boolean(
+    lastInput &&
+    (!latestAssistantMessage ||
+      new Date(latestAssistantMessage.created_at).getTime() < new Date(lastInput.created_at).getTime()),
+  );
+  const displayedStream = liveStream || (awaitingAnswer ? latestStream : undefined);
+  const completedTurns = turnEvents.filter(event => event.type === "MODEL_TURN");
+  const latestCompletedUsage = (completedTurns.at(-1)?.payload.usage || {}) as Record<string, unknown>;
+  const usage = {
+    // Input is the current context size, not the sum of context resent across
+    // internal calls. Output is the work generated across this response.
+    input: Number(displayedStream?.payload.input_tokens ?? latestCompletedUsage.input_tokens) || 0,
+    output: completedTurns.reduce((total, event) => {
       const value = (event.payload.usage || {}) as Record<string, unknown>;
-      total.input += Number(value.input_tokens) || 0;
-      total.output += Number(value.output_tokens) || 0;
-      return total;
-    },
-    {
-      input: Number(liveStream?.payload.input_tokens) || 0,
-      output: Number(liveStream?.payload.output_tokens) || 0,
-      estimated: Boolean(liveStream?.payload.estimated),
-    },
+      return total + (Number(value.output_tokens) || 0);
+    }, Number(liveStream?.payload.output_tokens) || 0),
+    estimated: Boolean(displayedStream?.payload.estimated),
+  };
+  const responsePreview = String(displayedStream?.payload.response_preview || "");
+  const currentAssistant = Boolean(
+    lastInput && latestAssistantMessage &&
+    new Date(latestAssistantMessage.created_at).getTime() >= new Date(lastInput.created_at).getTime(),
+  );
+  const finalResponse = currentAssistant && latestStream?.payload.response_preview
+    ? latestAssistantMessage?.text || ""
+    : "";
+  const streamTarget = responsePreview || finalResponse;
+  const handingOffResponse = Boolean(
+    finalResponse && streamedResponse !== finalResponse,
   );
   const timeline = conversationTimeline(data, project.root_holon_id);
   const started =
     turnEvents.find((event) => event.type === "JOB_STARTED")?.created_at ||
-    lastInput?.created_at;
+    (awaitingInputEvent ? latestUserMessage?.created_at : lastInput?.created_at);
   useEffect(() => {
     if (!busy) {
       setElapsed(0);
@@ -168,12 +200,36 @@ export function Conversation({
     return () => clearInterval(timer);
   }, [busy, started]);
   useEffect(() => {
+    if (!streamTarget) {
+      streamedResponseRef.current = "";
+      setStreamedResponse("");
+      return;
+    }
+    let frame = 0;
+    const reveal = () => {
+      const current = streamedResponseRef.current;
+      if (current === streamTarget) return;
+      let prefix = current;
+      if (!streamTarget.startsWith(prefix)) {
+        let common = 0;
+        while (common < prefix.length && common < streamTarget.length && prefix[common] === streamTarget[common]) common += 1;
+        prefix = prefix.slice(0, common);
+      }
+      const next = streamTarget.slice(0, prefix.length + Math.min(8, streamTarget.length - prefix.length));
+      streamedResponseRef.current = next;
+      setStreamedResponse(next);
+      frame = requestAnimationFrame(reveal);
+    };
+    frame = requestAnimationFrame(reveal);
+    return () => cancelAnimationFrame(frame);
+  }, [streamTarget]);
+  useEffect(() => {
     if (atBottom && scroll.current)
       scroll.current.scrollTo({
         top: scroll.current.scrollHeight,
         behavior: "smooth",
       });
-  }, [data.messages.length, tools.length, atBottom]);
+  }, [data.messages.length, tools.length, streamedResponse, atBottom]);
   useEffect(() => { if (visible) input.current?.focus(); }, [visible, reference?.nodeId]);
   useEffect(() => {
     const textarea = input.current;
@@ -304,9 +360,8 @@ export function Conversation({
             </div>
           )}
           {timeline.map((entry) =>
-            entry.kind === "activity" ? (
-              <ActivitySummary items={entry.items} key={entry.id} />
-            ) : (
+            entry.kind === "message" ? (
+              handingOffResponse && entry.message.id === latestAssistantMessage?.id ? null :
               <article
                 key={entry.id}
                 className={`chat-message ${entry.message.role}`}
@@ -325,8 +380,12 @@ export function Conversation({
                 {!!entry.message.node_ids?.length && <div className="message-node-refs">{entry.message.node_ids.map(id => <span key={id} title={id}><GitBranch size={11} />{id.slice(0, 8)}</span>)}</div>}
                 <Markdown>{entry.message.text}</Markdown>
               </article>
-            ),
+            ) : null,
           )}
+          {(busy || handingOffResponse) && streamedResponse && <article className="chat-message assistant streaming-response" aria-live="polite">
+            <header><Sparkles size={15} /><strong>Sapling</strong><span className="streaming-cursor" aria-hidden="true" /></header>
+            <Markdown>{streamedResponse}</Markdown>
+          </article>}
           {data.attention
             .filter(
               (item) => item.status === "pending" && item.type === "permission",
@@ -372,8 +431,8 @@ export function Conversation({
               </strong>
               <span
                 className="token-activity"
-                title="Tokens sent to and received from the model in this response"
-                aria-label={`${usage.input} input tokens and ${usage.output} output tokens`}
+                title="Current model context ↑ · tokens generated across this response ↓"
+                aria-label={`${usage.input} context tokens and ${usage.output} generated tokens`}
               >
                 <span>↑ {usage.estimated ? "~" : ""}{tokenCount(usage.input)}</span>
                 <span>↓ {usage.estimated ? "~" : ""}{tokenCount(usage.output)}</span>
@@ -630,54 +689,6 @@ function toolLabel(event: ResearchEvent) {
         retrieve_evidence: "Reviewing evidence",
       } as Record<string, string>
     )[String(event.payload.kind)] || "Working"
-  );
-}
-
-function ActivitySummary({ items }: { items: ActivityItem[] }) {
-  const notes = items.filter(
-    (item): item is Extract<ActivityItem, { kind: "note" }> => item.kind === "note",
-  );
-  const actions = items.filter(
-    (item): item is Extract<ActivityItem, { kind: "tool" }> => item.kind === "tool",
-  );
-  const latestNote = notes.at(-1);
-  const latestAction = actions.at(-1);
-  const headline = latestNote
-    ? compactNote(latestNote.text)
-    : latestAction
-      ? toolLabel(latestAction.event)
-      : "Thought through the next step";
-  const actionDetail = latestAction
-    ? String(
-        latestAction.event.payload.query ||
-          latestAction.event.payload.url ||
-          latestAction.event.payload.summary ||
-          "",
-      )
-    : "";
-
-  return (
-    <details className="turn-activity">
-      <summary>
-        <span>Thought process</span>
-        <strong>{headline}</strong>
-        <ChevronDown size={12} />
-      </summary>
-      <div className="thinking-summary">
-        {latestNote && <p>{compactNote(latestNote.text)}</p>}
-        {latestAction && (
-          <div className="latest-action">
-            <span>{toolLabel(latestAction.event)}</span>
-            {actionDetail && <small>{actionDetail}</small>}
-          </div>
-        )}
-        <small>
-          {notes.length ? `${notes.length} reasoning update${notes.length === 1 ? "" : "s"}` : ""}
-          {notes.length && actions.length ? " · " : ""}
-          {actions.length ? `${actions.length} research action${actions.length === 1 ? "" : "s"}` : ""}
-        </small>
-      </div>
-    </details>
   );
 }
 

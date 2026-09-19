@@ -3,7 +3,7 @@ import hashlib
 import pytest
 from fastapi.testclient import TestClient
 
-from sapling.api import create_app
+from sapling.api import _coalesce_live_events, create_app
 from sapling.store import Store
 
 
@@ -35,6 +35,23 @@ def project(client, **kwargs):
     return response.json()
 
 
+def test_live_event_batch_keeps_latest_stream_snapshot_before_completion():
+    events = [
+        {"id": 10, "type": "MODEL_STREAM", "payload": {"stream_id": "9", "output_tokens": 2}},
+        {"id": 11, "type": "MODEL_STREAM", "payload": {"stream_id": "9", "output_tokens": 18}},
+        {"id": 12, "type": "MODEL_TURN", "payload": {"stream_id": "9"}},
+        {"id": 13, "type": "JOB_FINISHED", "payload": {}},
+    ]
+
+    visible = _coalesce_live_events(events)
+
+    assert [(event["id"], event["type"]) for event in visible] == [
+        (11, "MODEL_STREAM"),
+        (12, "MODEL_TURN"),
+        (13, "JOB_FINISHED"),
+    ]
+
+
 def test_project_bootstrap_chat_and_isolation(app_client):
     client, store = app_client
     p, other = project(client), project(client, title="Independent")
@@ -42,6 +59,7 @@ def test_project_bootstrap_chat_and_isolation(app_client):
     tree = client.get(f"/projects/{p['id']}/tree").json()
     assert len(h) == len(tree) == 1
     assert h[0]["assigned_node_id"] == tree[0]["id"]
+    assert tree[0]["title"] == "Converse"
     assert tree[0]["value_estimate"] == 0.5
     assert tree[0]["value_confidence"] == 0.0
     r = client.post(f"/projects/{p['id']}/messages", json={"text": "Investigate this open question"})

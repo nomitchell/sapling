@@ -144,33 +144,61 @@ export function Workspace() {
     let source: EventSource | undefined;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let eventPoll: ReturnType<typeof setInterval> | undefined;
     eventCursor.current = "0";
+    const mergeEventBatch = (batch: ResearchEvent[]) => {
+      if (cancelled || selectedRef.current !== selectedId || !batch.length) return;
+      const currentCursor = Number(eventCursor.current) || 0;
+      const unseen = batch.filter((event) => (Number(event.id) || 0) > currentCursor);
+      if (!unseen.length) return;
+      const newest = Math.max(
+        currentCursor,
+        ...unseen.map((event) => Number(event.id) || 0),
+      );
+      eventCursor.current = String(newest);
+      setData((current) => ({
+        ...current,
+        events: unseen.reduce(mergeResearchEvent, current.events),
+      }));
+    };
+    const pollEvents = async () => {
+      const after = eventCursor.current;
+      const batch = await api<ResearchEvent[]>(
+        `/projects/${selectedId}/events?after=${after}`,
+      );
+      mergeEventBatch(batch);
+    };
     void refreshData(selectedId, true).then(() => {
       if (cancelled) return;
+      const liveOrigin = process.env.NEXT_PUBLIC_SAPLING_API_URL ||
+        `${window.location.protocol}//${window.location.hostname}:8000`;
       source = new EventSource(
-        `/api/projects/${selectedId}/events/stream?after=${eventCursor.current}`,
+        `${liveOrigin}/projects/${selectedId}/events/stream?after=${eventCursor.current}`,
       );
       source.onopen = () => setConnected(true);
       source.onerror = () => setConnected(false);
       source.addEventListener("research", (message) => {
         const event = JSON.parse((message as MessageEvent).data) as ResearchEvent;
-        eventCursor.current = event.id;
-        setData((current) => ({
-          ...current,
-          events: mergeResearchEvent(current.events, event),
-        }));
+        mergeEventBatch([event]);
         if (!timer)
           timer = setTimeout(() => {
             timer = undefined;
             refresh();
           }, 150);
       });
+      // Some development proxies buffer EventSource bodies. A small cursor-based
+      // poll keeps live model text and token counters moving in that case while
+      // remaining nearly free when SSE is delivering normally.
+      eventPoll = setInterval(() => {
+        void pollEvents().catch(() => undefined);
+      }, 750);
     }).catch((err) => setError(errorText(err)));
     const poll = setInterval(refresh, 5000);
     return () => {
       cancelled = true;
       source?.close();
       clearInterval(poll);
+      if (eventPoll) clearInterval(eventPoll);
       if (timer) clearTimeout(timer);
       setConnected(false);
     };

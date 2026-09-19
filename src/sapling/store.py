@@ -127,6 +127,10 @@ class Store:
                         "active_conversation_id": None,
                         "status": "archived" if project.get("status") == "archived" else "active",
                     })
+                root = tx.get("holons", project.get("root_holon_id"))
+                node = tx.get("research_nodes", (root or {}).get("assigned_node_id"))
+                if node and node.get("title") == "Research direction":
+                    tx.update("research_nodes", node["id"], {"title": "Converse"})
             for item in tx.list("attention_items"):
                 if "read_at" not in item:
                     owner = tx.get("holons", item.get("holon_id"))

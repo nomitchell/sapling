@@ -1970,6 +1970,9 @@ async def _call_model(
             "estimated": bool(progress.get("estimated", True)),
             "phase": str(progress.get("phase", "thinking")),
         }
+        preview = progress.get("response_preview")
+        if isinstance(preview, str) and preview:
+            payload["response_preview"] = preview[:40_000]
         if payload["phase"] not in {"thinking", "responding", "finalizing"}:
             payload["phase"] = "thinking"
         with store.transaction() as tx:

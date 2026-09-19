@@ -10,6 +10,7 @@ from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -136,6 +137,22 @@ def record_conversation(tx, project, text, node_ids=None, attention_ids=None):
     return message
 
 
+def _coalesce_live_events(events: list[dict]) -> list[dict]:
+    """Keep one renderable model snapshot per stream in an SSE polling batch."""
+    latest_stream: dict[str, dict] = {}
+    visible: list[dict] = []
+    for event in events:
+        stream_id = str(event.get("payload", {}).get("stream_id", ""))
+        if event.get("type") == "MODEL_STREAM" and stream_id:
+            latest_stream[stream_id] = event
+            continue
+        if event.get("type") == "MODEL_TURN" and stream_id in latest_stream:
+            visible.append(latest_stream.pop(stream_id))
+        visible.append(event)
+    visible.extend(latest_stream.values())
+    return sorted(visible, key=lambda event: int(event["id"]))
+
+
 def create_app(store: Store | None = None, *, data_dir: Path | None = None, workers=True, vault=None):
     store = store or Store(DATABASE_URL)
     data_dir = (data_dir or DATA_DIR).resolve()
@@ -159,6 +176,12 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
     app = FastAPI(title="Sapling", version="0.1.0", lifespan=lifespan)
     app.state.store, app.state.data_dir, app.state.vault = store, data_dir, vault
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]", "testserver"])
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_methods=["GET"],
+        allow_headers=["Last-Event-ID", "Cache-Control"],
+    )
 
     @app.middleware("http")
     async def local_origin(request: Request, call_next):
@@ -303,7 +326,7 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                     "project_id": pid,
                     "parent_id": None,
                     "owning_holon_id": hid,
-                    "title": "Research direction",
+                    "title": "Converse",
                     "direction": goal,
                     "rationale": "Direction develops through conversation",
                     "interpretation": "",
@@ -638,18 +661,23 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
 
         async def stream():
             nonlocal cursor
-            idle = 0
+            loop = asyncio.get_running_loop()
+            last_heartbeat = loop.time()
+            # Flush response headers immediately so a quiet project still
+            # reports a healthy live connection in the interface.
+            yield ": connected\n\n"
             while not await request.is_disconnected():
                 with store.transaction() as tx:
                     batch = tx.history(pid, cursor)
-                for event in batch:
-                    cursor = event["id"]
-                    yield f"id: {cursor}\nevent: research\ndata: {json.dumps(event)}\n\n"
+                for event in _coalesce_live_events(batch):
+                    yield f"id: {event['id']}\nevent: research\ndata: {json.dumps(event)}\n\n"
+                if batch:
+                    cursor = batch[-1]["id"]
                 if not batch:
-                    idle += 1
-                    if idle % 15 == 0:
+                    if loop.time() - last_heartbeat >= 15:
                         yield ": heartbeat\n\n"
-                    await asyncio.sleep(1)
+                        last_heartbeat = loop.time()
+                    await asyncio.sleep(0.05)
 
         return StreamingResponse(
             stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"}

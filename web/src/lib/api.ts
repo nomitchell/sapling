@@ -55,14 +55,15 @@ export async function loadEvents(projectId: string): Promise<ResearchEvent[]> {
 export function mergeResearchEvent(events: ResearchEvent[], event: ResearchEvent) {
   const streamId = String(event.payload.stream_id || "");
   if (event.type === "MODEL_STREAM") {
+    const previous = [...events].reverse().find((item) =>
+      item.type === "MODEL_STREAM" && String(item.payload.stream_id || "") === streamId
+    );
+    const next = previous?.payload.response_preview && !event.payload.response_preview
+      ? { ...event, payload: { ...event.payload, response_preview: previous.payload.response_preview } }
+      : event;
     return [...events.filter((item) =>
       item.type !== "MODEL_STREAM" || String(item.payload.stream_id || "") !== streamId
-    ), event];
-  }
-  if (event.type === "MODEL_TURN" && streamId) {
-    return [...events.filter((item) =>
-      item.type !== "MODEL_STREAM" || String(item.payload.stream_id || "") !== streamId
-    ), event];
+    ), next];
   }
   if (events.some((item) => item.id === event.id)) return events;
   return [...events, event];

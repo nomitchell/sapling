@@ -4,13 +4,15 @@ import asyncio
 import inspect
 import json
 import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Awaitable, Callable, TypeVar
+from time import monotonic
+from typing import Any, TypeVar
 
 from openai import (
-    AsyncOpenAI,
     APIStatusError,
+    AsyncOpenAI,
 )
 from pydantic import BaseModel, ValidationError
 
@@ -23,6 +25,108 @@ ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 def approximate_tokens(value: str) -> int:
     """Return a responsive display estimate until the provider reports usage."""
     return max(1, math.ceil(len(value.encode("utf-8")) / 4))
+
+
+def partial_json_string_field(value: str, field: str) -> str | None:
+    """Decode the completed portion of one streamed JSON string field.
+
+    Structured model output is not suitable for display as it arrives. This
+    extracts only the public response field and never exposes sibling fields.
+    """
+    def string_end(start: int) -> tuple[int, bool]:
+        escaped = False
+        index = start + 1
+        while index < len(value):
+            character = value[index]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                return index, True
+            index += 1
+        return index, False
+
+    def value_end(start: int) -> int | None:
+        if start >= len(value):
+            return None
+        if value[start] == '"':
+            end, complete = string_end(start)
+            return end + 1 if complete else None
+        if value[start] in "[{":
+            stack = ["]" if value[start] == "[" else "}"]
+            index = start + 1
+            while index < len(value):
+                if value[index] == '"':
+                    end, complete = string_end(index)
+                    if not complete:
+                        return None
+                    index = end + 1
+                    continue
+                if value[index] in "[{":
+                    stack.append("]" if value[index] == "[" else "}")
+                elif value[index] in "]}":
+                    if not stack or value[index] != stack.pop():
+                        return None
+                    if not stack:
+                        return index + 1
+                index += 1
+            return None
+        index = start
+        while index < len(value) and value[index] not in ",}":
+            index += 1
+        return index if index < len(value) else None
+
+    index = value.find("{")
+    if index < 0:
+        return None
+    index += 1
+    while index < len(value):
+        while index < len(value) and value[index] in " \r\n\t,":
+            index += 1
+        if index >= len(value) or value[index] == "}":
+            return None
+        if value[index] != '"':
+            return None
+        key_end, complete = string_end(index)
+        if not complete:
+            return None
+        try:
+            key = json.loads(value[index:key_end + 1])
+        except json.JSONDecodeError:
+            return None
+        index = key_end + 1
+        while index < len(value) and value[index].isspace():
+            index += 1
+        if index >= len(value) or value[index] != ":":
+            return None
+        index += 1
+        while index < len(value) and value[index].isspace():
+            index += 1
+        if key == field:
+            if index >= len(value) or value[index] != '"':
+                return None
+            end, complete = string_end(index)
+            raw = value[index + 1:end]
+            if not complete and raw.endswith("\\"):
+                raw = raw[:-1]
+            # Preserve the visible prefix while waiting for a complete unicode
+            # escape from the next network chunk.
+            unicode_escape = raw.rfind("\\u")
+            if unicode_escape >= 0 and len(raw) - unicode_escape < 6:
+                raw = raw[:unicode_escape]
+            elif len(raw) >= 6 and raw[-6:-4] == "\\u":
+                try:
+                    if 0xD800 <= int(raw[-4:], 16) <= 0xDBFF:
+                        raw = raw[:-6]
+                except ValueError:
+                    pass
+            try:
+                return json.loads(f'"{raw}"')
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return None
+        index = value_end(index) or len(value)
+    return None
 
 
 async def notify_progress(callback: ProgressCallback | None, **payload: Any) -> None:
@@ -224,7 +328,7 @@ class ModelRuntime:
         cached_input_cost_per_million: float | None = None,
         *,
         client: Any = None,
-        timeout_seconds: float = 120,
+        timeout_seconds: float | None = None,
     ) -> None:
         self.api_key = api_key
         self.model = model
@@ -395,20 +499,37 @@ class OpenAIModelRuntime(ModelRuntime):
                     response = None
                     output_characters = 0
                     last_reported = 0
+                    output_parts: list[str] = []
+                    last_preview = ""
+                    last_reported_at = 0.0
                     async for event in stream:
                         event_type = getattr(event, "type", "")
                         if event_type in {
                             "response.output_text.delta",
                             "response.reasoning_summary_text.delta",
                         }:
-                            output_characters += len(getattr(event, "delta", "") or "")
+                            delta = getattr(event, "delta", "") or ""
+                            output_characters += len(delta)
+                            if event_type == "response.output_text.delta":
+                                output_parts.append(delta)
+                            preview = partial_json_string_field("".join(output_parts), "response") or ""
                             output_estimate = approximate_tokens("x" * output_characters)
-                            if output_estimate - last_reported >= 64:
+                            reported_at = monotonic()
+                            if (
+                                (preview and not last_preview)
+                                or (
+                                    output_estimate - last_reported >= 3
+                                    and reported_at - last_reported_at >= 0.05
+                                )
+                            ):
                                 last_reported = output_estimate
+                                last_preview = preview
+                                last_reported_at = reported_at
                                 await notify_progress(
                                     progress, input_tokens=input_estimate,
                                     output_tokens=output_estimate, estimated=True,
                                     phase="responding" if event_type == "response.output_text.delta" else "thinking",
+                                    response_preview=preview,
                                 )
                         elif event_type == "response.completed":
                             response = event.response
@@ -431,7 +552,12 @@ class OpenAIModelRuntime(ModelRuntime):
             getattr(usage, "input_tokens", None), getattr(usage, "output_tokens", None),
             getattr(details, "cached_tokens", 0) or 0,
         )
-        await notify_progress(progress, **usage_dict, estimated=False, phase="finalizing")
+        final_text = final_response_text(response) if progress is not None else ""
+        final_preview = partial_json_string_field(final_text, "response") or ""
+        await notify_progress(
+            progress, **usage_dict, estimated=False, phase="finalizing",
+            **({"response_preview": final_preview} if final_preview else {}),
+        )
         if getattr(response, "status", "completed") != "completed":
             reason = getattr(getattr(response, "incomplete_details", None), "reason", "incomplete")
             raise ModelResponseError(
@@ -445,7 +571,7 @@ class OpenAIModelRuntime(ModelRuntime):
             )
         try:
             if progress is not None:
-                raw_decision = json.loads(final_response_text(response))
+                raw_decision = json.loads(final_text)
                 decision = decision_type.model_validate(
                     decode_wire(raw_decision, schema, schema) if json_mode else raw_decision
                 )
@@ -558,6 +684,8 @@ class BasetenModelRuntime(ModelRuntime):
                 pieces: list[str] = []
                 output_characters = 0
                 last_reported = 0
+                last_preview = ""
+                last_reported_at = 0.0
                 final_usage = None
                 final_reason = None
                 response_id = None
@@ -577,13 +705,24 @@ class BasetenModelRuntime(ModelRuntime):
                         saw_refusal = saw_refusal or bool(getattr(delta, "refusal", None))
                         saw_tools = saw_tools or bool(getattr(delta, "tool_calls", None))
                         output_characters += len(text) + len(reasoning)
+                        preview = partial_json_string_field("".join(pieces), "response") or ""
                         output_estimate = approximate_tokens("x" * output_characters)
-                        if output_estimate - last_reported >= 64:
+                        reported_at = monotonic()
+                        if (
+                            (preview and not last_preview)
+                            or (
+                                output_estimate - last_reported >= 3
+                                and reported_at - last_reported_at >= 0.05
+                            )
+                        ):
                             last_reported = output_estimate
+                            last_preview = preview
+                            last_reported_at = reported_at
                             await notify_progress(
                                 progress, input_tokens=input_estimate,
                                 output_tokens=output_estimate, estimated=True,
                                 phase="responding" if text else "thinking",
+                                response_preview=preview,
                             )
                 return {
                     "usage": final_usage, "finish_reason": final_reason,
@@ -607,7 +746,11 @@ class BasetenModelRuntime(ModelRuntime):
             getattr(usage, "prompt_tokens", None), getattr(usage, "completion_tokens", None),
             getattr(details, "cached_tokens", 0) or 0,
         )
-        await notify_progress(progress, **usage_dict, estimated=False, phase="finalizing")
+        final_preview = partial_json_string_field(content or "", "response") or ""
+        await notify_progress(
+            progress, **usage_dict, estimated=False, phase="finalizing",
+            **({"response_preview": final_preview} if final_preview else {}),
+        )
         error_data = {"usage": usage_dict, "cost_usd": cost, "response_id": response_id}
         if len(choices) != 1 or finish_reason != "stop":
             reason = finish_reason or "missing_choice"

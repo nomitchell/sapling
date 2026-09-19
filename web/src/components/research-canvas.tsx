@@ -72,6 +72,9 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
       onError(errorText(error));
     });
   }, [readIds, onRefresh, onError]);
+  const jobs = (Array.isArray(data.stats.jobs) ? data.stats.jobs as RecordItem[] : []);
+  const runningHolons = new Set(jobs.filter(job => job.state === "running").map(job => String(job.holon_id || "")));
+  const runningNodes = new Set(data.holarchy.filter(holon => runningHolons.has(holon.id)).map(holon => String(holon.assigned_node_id || "")));
   function attentionCounts(id: string, recursive: boolean, seen = new Set<string>()): { unread: number; blocked: number; running: number } {
     if (seen.has(id)) return { unread: 0, blocked: 0, running: 0 };
     seen.add(id);
@@ -79,7 +82,7 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
     const count = {
       unread: items.filter(item => !item.pauses_subtree && item.type !== "permission" && !item.read_at).length,
       blocked: items.filter(item => item.pauses_subtree || item.type === "permission").length,
-      running: data.holarchy.filter(holon => holon.assigned_node_id === id && holon.status === "active").length,
+      running: runningNodes.has(id) ? 1 : 0,
     };
     if (recursive) (result.children.get(id) || []).forEach(child => {
       const next = attentionCounts(child.id, true, seen);
@@ -106,7 +109,7 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
     dragged.current = { pointer: event.pointerId, x: event.clientX, y: event.clientY, originX: view.x, originY: view.y };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
-  const activeJobs = (Array.isArray(data.stats.jobs) ? data.stats.jobs as RecordItem[] : []).filter(job => job.state === "running").length;
+  const activeJobs = runningHolons.size;
   return <div className="research-stage">
     <div className="canvas-heading">
       <div><span className="eyebrow">Research tree</span><h1>{project.goal ? "Following the question." : "Room for a good question."}</h1></div>
@@ -137,11 +140,12 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
         </svg>
         {result.nodes.map(({ record, x, y, children }) => {
           const count = attentionCounts(record.id, collapsed.has(record.id));
-          const state = count.blocked ? "blocked" : count.unread ? "unread" : record.status === "completed" ? "completed" : record.status === "paused" ? "paused" : count.running && activeJobs ? "running" : "ready";
-          const title = field(record, "title", "question", "goal") || project.title;
+          const isRoot = !record.parent_id;
+          const state = count.blocked ? "blocked" : count.unread ? "unread" : record.status === "completed" ? "completed" : record.status === "paused" ? "paused" : count.running ? "running" : "ready";
+          const title = isRoot ? "Converse" : field(record, "title", "question", "goal") || project.title;
           return <div className={`research-node state-${state} ${selectedId === record.id ? "selected" : ""}`} key={record.id} style={{ left: x, top: y, width: WIDTH, height: HEIGHT }}>
             <button className="research-node-main" aria-label={`${title}, ${state === "unread" ? "check me" : state}`} aria-pressed={selectedId === record.id} onClick={() => { setSelectedId(record.id); setCopied(false); }}>
-              <span className="research-node-top"><span>{!record.parent_id ? <Sprout size={13} /> : <GitBranch size={12} />}{label(record.type || (!record.parent_id ? "direction" : "inquiry"))}</span><span className="node-state-dot" /></span>
+              <span className="research-node-top"><span>{isRoot ? <Sprout size={13} /> : <GitBranch size={12} />}{isRoot ? "Converse" : label(record.type || "inquiry")}</span><span className={`node-agent-status ${runningNodes.has(record.id) ? "running" : "idle"}`} title={runningNodes.has(record.id) ? "Agent running on this node" : "No agent running on this node"}><i />{runningNodes.has(record.id) ? "live" : "idle"}</span></span>
               <strong>{title}</strong>
               <span className="research-node-bottom">{state === "blocked" ? "Needs your input" : state === "unread" ? "Check me" : state === "running" ? "Researching" : state === "ready" ? "Ready to explore" : label(state)}{collapsed.has(record.id) && (count.running + count.unread + count.blocked > 0) && <small>{count.blocked ? `${count.blocked} waiting` : count.unread ? `${count.unread} unread` : `${count.running} active`}</small>}</span>
             </button>
@@ -153,9 +157,9 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
     </div>
     <div className="canvas-footer"><div className="canvas-legend"><span><i className="running" />{activeJobs ? `${activeJobs} working` : "No active work"}</span><span><i className="unread" />Check me</span><span><i className="blocked" />Needs input</span></div><div className="canvas-controls"><button aria-label="Zoom out" onClick={() => zoomBy(1 / 1.2)}><Minus size={14} /></button><span>{Math.round(view.zoom * 100)}%</span><button aria-label="Zoom in" onClick={() => zoomBy(1.2)}><Plus size={14} /></button><button aria-label="Fit research tree" onClick={fit}><Expand size={14} /></button></div></div>
     {selected && <aside className="node-inspector" aria-label="Research node details">
-      <header><span className="eyebrow">Research direction</span><button className="icon-button" aria-label="Close node details" onClick={() => setSelectedId(null)}><X size={15} /></button></header>
+      <header><span className="eyebrow">{selected.parent_id ? "Research direction" : "Converse"}</span><button className="icon-button" aria-label="Close node details" onClick={() => setSelectedId(null)}><X size={15} /></button></header>
       <div className="node-inspector-scroll">
-        <h2>{field(selected, "title", "question", "goal") || project.title}</h2>
+        <h2>{selected.parent_id ? field(selected, "title", "question", "goal") || project.title : "Converse"}</h2>
         <div className="node-id-row"><code title={selected.id}>{selected.id}</code><button className="icon-button" aria-label="Copy node ID" onClick={() => void navigator.clipboard.writeText(selected.id).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1800); }).catch(error => onError(errorText(error)))}>{copied ? <Check size={14} /> : <Copy size={14} />}</button></div>
         {selectedAttention.map(item => <article className={`node-attention ${item.pauses_subtree || item.type === "permission" ? "blocking" : ""}`} key={item.id}><strong>{item.pauses_subtree || item.type === "permission" ? "Waiting for your input" : "Research update"}</strong><Markdown>{field(item, "summary", "description")}</Markdown><small>{item.pauses_subtree || item.type === "permission" ? "Discuss in Converse to resolve this. Reading does not resume work." : "Work continues while you review this update."}</small></article>)}
         {field(selected, "summary", "description") && <div className="node-summary"><Markdown>{field(selected, "summary", "description")}</Markdown></div>}

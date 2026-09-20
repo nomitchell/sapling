@@ -172,7 +172,12 @@ export function Conversation({
   // The user message is present before live events arrive and remains stable
   // through the entire turn. Event IDs can arrive a frame later and must not
   // restart the visible response.
-  const responseKey = latestUserMessage?.id || null;
+  // A single user turn can contain a tool call followed by a synthesis call.
+  // Reset only when that root model call changes, never for child activity.
+  const latestRootStreamId = [...turnEvents]
+    .reverse()
+    .find(event => event.type === "MODEL_STREAM")?.payload.stream_id;
+  const responseKey = `${latestUserMessage?.id || ""}:${String(latestRootStreamId || "")}`;
   // Once the durable message lands, keep this same rendered element as its
   // owner. Replacing it with a second timeline element is visually a wipe.
   const ownsLatestAssistant = currentAssistant && Boolean(streamedResponse);

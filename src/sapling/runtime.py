@@ -2438,7 +2438,18 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 "holon_id": hid,
                 "reason": "no_fresh_material_direct_child_report",
             })
-    if decision.response and hid == project.get("root_holon_id") and not (
+    defer_converse_response = bool(
+        decision.work_orders
+        and hid == project.get("root_holon_id")
+        and conversation_request(project, work_scope(holon))
+    )
+    if defer_converse_response and decision.response:
+        tx.event(
+            pid,
+            "CONVERSE_RESPONSE_DEFERRED",
+            {"holon_id": hid, "reason": "root_work_selected"},
+        )
+    if decision.response and not defer_converse_response and hid == project.get("root_holon_id") and not (
         handoff_setting_up and report_text == decision.response
     ):
         message = tx.create(

@@ -169,7 +169,10 @@ export function Conversation({
   );
   const finalResponse = currentAssistant ? latestAssistantMessage?.text || "" : "";
   const streamTarget = finalResponse || responsePreview;
-  const responseKey = lastInput?.id || latestUserMessage?.id || null;
+  // The user message is present before live events arrive and remains stable
+  // through the entire turn. Event IDs can arrive a frame later and must not
+  // restart the visible response.
+  const responseKey = latestUserMessage?.id || null;
   // Once the durable message lands, keep this same rendered element as its
   // owner. Replacing it with a second timeline element is visually a wipe.
   const ownsLatestAssistant = currentAssistant && Boolean(streamedResponse);

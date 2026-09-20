@@ -362,6 +362,12 @@ class LocalProcessBackend:
         return record
 
     def _command(self, workspace: Workspace, command: list[str], run_id: str) -> list[str]:
+        executable = Path(command[0]).name.casefold()
+        if os.name == "nt" and executable in {"bash", "bash.exe", "sh", "sh.exe", "wsl", "wsl.exe"}:
+            raise ExecutionUnavailable(
+                "Linux shell commands are disabled for local Windows experiments. "
+                "Use Python or PowerShell with explicit arguments instead."
+            )
         if (
             self.python_executable
             and command[0].casefold() in {"python", "python.exe"}
@@ -500,7 +506,13 @@ class LocalProcessBackend:
                     if scanned > self.max_artifact_files * 10:
                         raise WorkspaceViolation("The workspace contains too many entries to collect safely.")
                     relative = path.relative_to(workspace.path)
-                    if path in seen or any(part in {".git", ".home", ".tmp", "__pycache__", ".venv", "node_modules"} for part in relative.parts):
+                    if path in seen or any(part.casefold() in {
+                        ".git", ".home", ".tmp", "__pycache__", ".venv", "node_modules",
+                        # Downloaded corpora are experiment inputs. Persisting
+                        # them as output artifacts both duplicates data and can
+                        # wrongly invalidate an otherwise successful run.
+                        "data", "datasets", ".cache", "cache",
+                    } for part in relative.parts):
                         continue
                     seen.add(path)
                     if path.is_symlink() or not path.resolve().is_relative_to(workspace.path.resolve()):

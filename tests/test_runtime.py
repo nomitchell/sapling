@@ -105,6 +105,30 @@ def event_types(store):
         return list(tx.conn.execute(select(events.c.type)).scalars())
 
 
+def test_experiment_prediction_becomes_an_open_claim(store):
+    apply(
+        store,
+        decision(
+            work_orders=[
+                {
+                    "node_id": "n",
+                    "kind": "run_experiment",
+                    "arguments": {
+                        "command": ["python", "trial.py"],
+                        "prediction": "The smaller intervention improves the robust score at matched compute.",
+                    },
+                    "rationale": "A matched trial can distinguish the candidate from its baseline.",
+                }
+            ]
+        ),
+    )
+    claims = rows(store, "claims")
+    assert len(claims) == 1
+    assert claims[0]["status"] == "open"
+    assert claims[0]["origin_type"] == "experiment_prediction"
+    assert claims[0]["statement"].startswith("The smaller intervention")
+
+
 def activate_conversation(store, scope="conversation:bounded"):
     request_id = scope.split(":", 1)[1]
     with store.transaction() as tx:

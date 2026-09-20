@@ -307,6 +307,8 @@ def create_app(store: Store | None = None, *, data_dir: Path | None = None, work
                     "id": hid,
                     "project_id": pid,
                     "parent_id": None,
+                    "role": "converse",
+                    "work_scope": "converse",
                     "goal": goal,
                     "summary": "",
                     "assigned_node_id": nid,

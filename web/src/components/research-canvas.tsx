@@ -156,7 +156,7 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
           const type = nodeType(record);
           return <div className={`research-node state-${state} ${selectedId === record.id ? "selected" : ""}`} key={record.id} style={{ left: x, top: y, width: WIDTH, height: HEIGHT }}>
             <button className="research-node-main" aria-label={`${title}, ${state === "unread" ? "check me" : state}`} aria-pressed={selectedId === record.id} onClick={() => { setSelectedId(record.id); setCopied(false); }}>
-              <span className="research-node-top"><span>{isRoot ? <Sprout size={13} /> : <GitBranch size={12} />}{isRoot ? "Converse" : label(type)}</span><span className={`node-agent-status ${agentState}`} title={agentState === "running" ? "Agent running on this node" : agentState === "queued" ? "Agent work is queued" : agentState === "done" ? "This node has completed its purpose" : "No agent running on this node"}><i />{agentState === "running" ? "live" : agentState}</span></span>
+              <span className="research-node-top"><span>{isRoot ? <Sprout size={13} /> : <GitBranch size={12} />}{isRoot ? "Converse" : record.coordinator ? "Coordinator" : label(type)}</span><span className={`node-agent-status ${agentState}`} title={agentState === "running" ? "Agent running on this node" : agentState === "queued" ? "Agent work is queued" : agentState === "done" ? "This node has completed its purpose" : "No agent running on this node"}><i />{agentState === "running" ? "live" : agentState}</span></span>
               <strong>{title}</strong>
               <span className="research-node-bottom">{state === "blocked" ? "Needs your input" : state === "unread" ? "Check me" : state === "running" ? "Researching" : state === "queued" ? "Queued" : state === "done" ? "Done" : state === "idle" ? "Idle" : label(state)}{collapsed.has(record.id) && (count.running + count.unread + count.blocked > 0) && <small>{count.blocked ? `${count.blocked} waiting` : count.unread ? `${count.unread} unread` : `${count.running} active`}</small>}</span>
             </button>
@@ -178,7 +178,7 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
         <dl className="node-facts"><div><dt>Status</dt><dd>{selected.status === "completed" || selected.status === "abandoned" ? "Done" : runningNodes.has(selected.id) ? "Running" : queuedNodes.has(selected.id) || (selected.parent_id && Number(selected.visits || 0) === 0) ? "Queued" : selected.status === "paused" ? "Paused" : "Idle"}</dd></div>{selected.estimated_cost !== undefined && <div><dt>Next effort</dt><dd>{money(selected.estimated_cost)}</dd></div>}</dl>
         <NodeRecords data={data} node={selected} />
       </div>
-      <footer><button className="button primary" onClick={() => onDiscuss({ nodeId: selected.id, title: field(selected, "title", "question", "goal") || project.title, attentionIds: selectedAttention.map(item => item.id) })}><MessageSquare size={14} />Discuss in Converse</button></footer>
+      <footer><button className="button primary" onClick={() => onDiscuss({ nodeIds: [selected.id], titles: [field(selected, "title", "question", "goal") || project.title], attentionIds: selectedAttention.map(item => item.id) })}><MessageSquare size={14} />Add to Converse</button></footer>
     </aside>}
   </div>;
 }

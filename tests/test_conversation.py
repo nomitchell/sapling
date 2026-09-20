@@ -400,8 +400,13 @@ async def test_autoresearch_handoff_closes_old_conversation_after_initial_branch
         project = tx.get("projects", p["id"])
         request = project["conversation_requests"][project["active_conversation_id"]]
         messages = tx.list("messages", p["id"])
+        coordinator = tx.get("holons", project["campaign_coordinator_id"])
+        coordinator_node = tx.get("research_nodes", coordinator["assigned_node_id"])
         assert request["state"] == "completed"
         assert project["autoresearch_handoff"]["status"] == "running"
+        assert coordinator["parent_id"] == p["root_holon_id"]
+        assert coordinator["role"] == "campaign_coordinator"
+        assert coordinator_node["parent_id"] == tx.get("holons", p["root_holon_id"])["assigned_node_id"]
         assert any(m.get("text", "").startswith("Autoresearch has started") and m.get("channel") == "answer" for m in messages)
         assert not any(
             job["state"] == "queued" and job["payload"].get("work_scope") == scope

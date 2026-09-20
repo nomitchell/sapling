@@ -267,7 +267,17 @@ export function Workspace() {
     }
   }
   function discuss(next?: ConversationReference) {
-    if (next) setReference(next);
+    if (next) setReference(current => {
+      const ids = new Set([...(current?.nodeIds || []), ...next.nodeIds]);
+      const names = new Map<string, string>();
+      current?.nodeIds.forEach((id, index) => names.set(id, current.titles[index] || id));
+      next.nodeIds.forEach((id, index) => names.set(id, next.titles[index] || id));
+      return {
+        nodeIds: [...ids],
+        titles: [...ids].map(id => names.get(id) || id),
+        attentionIds: [...new Set([...(current?.attentionIds || []), ...(next.attentionIds || [])])],
+      };
+    });
     setConverseOpen(true);
   }
   const researchState = selected?.research_state || "planning";
@@ -429,7 +439,11 @@ export function Workspace() {
             <ResearchCanvas key={selected.id} project={selected} data={data} onDiscuss={discuss} onRefresh={refresh} onError={(message) => setError({ title: "Research canvas action failed.", detail: message, source: "action" })} onKnowledge={() => setInspection("knowledge")} />
             <aside id="converse-drawer" className="converse-drawer" aria-label="Converse" inert={!converseOpen} aria-hidden={!converseOpen}>
               <header className="converse-heading"><div><MessageSquare size={15} /><strong>Converse</strong><span>Your research partner</span></div><button className="icon-button" aria-label="Close Converse" onClick={() => { setConverseOpen(false); converseToggle.current?.focus(); }}><X size={16} /></button></header>
-              <Conversation key={selected.id} project={selected} data={data} connected={connected} onRefresh={refresh} onSettings={() => openSettings("project", "models")} onError={(message) => setError({ title: "Conversation action failed.", detail: message, source: "action" })} reference={reference} onClearReference={() => setReference(null)} visible={converseOpen} />
+              <Conversation key={selected.id} project={selected} data={data} connected={connected} onRefresh={refresh} onSettings={() => openSettings("project", "models")} onError={(message) => setError({ title: "Conversation action failed.", detail: message, source: "action" })} reference={reference} onClearReference={(nodeId) => setReference(current => {
+                if (!current || !nodeId) return null;
+                const kept = current.nodeIds.filter(id => id !== nodeId);
+                return kept.length ? { ...current, nodeIds: kept, titles: kept.map(id => current.titles[current.nodeIds.indexOf(id)] || id) } : null;
+              })} visible={converseOpen} />
             </aside>
           </div>
         )}

@@ -18,7 +18,7 @@ export type ResearchSettings = {
 
 export const defaults: ResearchSettings = {
   provider: "openai", model: "gpt-5.4-nano", reasoning_effort: "low", cadence: 0.45,
-  budget_total: 10, permission_mode: "balanced", execution_backend: "docker",
+  budget_total: 10, permission_mode: "balanced", execution_backend: "process",
   max_concurrent_holons: 4, max_depth: null, experiment_timeout: 300,
   max_output_tokens: 32768, max_turn_cost_usd: 1,
   input_cost_per_million: 0.2, output_cost_per_million: 1.25, cached_input_cost_per_million: 0.02,
@@ -34,7 +34,7 @@ export type Project = {
   root_holon_id?: string; created_at: string;
 };
 export type Message = { id: string; role: string; text: string; created_at: string; channel?: "answer" | "progress"; node_ids?: string[]; attention_ids?: string[] };
-export type ConversationReference = { nodeId: string; title: string; attentionIds?: string[] };
+export type ConversationReference = { nodeIds: string[]; titles: string[]; attentionIds?: string[] };
 export type ProjectData = { messages: Message[]; tree: RecordItem[]; holarchy: RecordItem[]; claims: RecordItem[]; evidence: RecordItem[]; experiments: RecordItem[]; attention: RecordItem[]; events: ResearchEvent[]; stats: Stats; artifacts: RecordItem[] };
 export const emptyData: ProjectData = { messages: [], tree: [], holarchy: [], claims: [], evidence: [], experiments: [], attention: [], events: [], stats: {}, artifacts: [] };
 export type RecordItem = Record<string, unknown> & { id: string; title?: string; status?: string; created_at?: string };

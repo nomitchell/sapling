@@ -63,7 +63,7 @@ export function Conversation({
   onSettings: () => void;
   onError: (error: string) => void;
   reference?: ConversationReference | null;
-  onClearReference?: () => void;
+  onClearReference?: (nodeId?: string) => void;
   visible?: boolean;
 }) {
   const [draft, setDraft] = useState("");
@@ -226,7 +226,7 @@ export function Conversation({
         behavior: "smooth",
       });
   }, [data.messages.length, tools.length, streamedResponse, atBottom]);
-  useEffect(() => { if (visible) input.current?.focus(); }, [visible, reference?.nodeId]);
+  useEffect(() => { if (visible) input.current?.focus(); }, [visible, reference?.nodeIds.join(",")]);
   useEffect(() => {
     const textarea = input.current;
     if (!textarea) return;
@@ -241,7 +241,7 @@ export function Conversation({
     try {
       await api(`/projects/${project.id}/messages`, {
         method: "POST",
-        body: JSON.stringify({ text: message, node_ids: reference ? [reference.nodeId] : [], attention_ids: reference?.attentionIds || [] }),
+        body: JSON.stringify({ text: message, node_ids: reference?.nodeIds || [], attention_ids: reference?.attentionIds || [] }),
       });
       setDraft("");
       onRefresh();
@@ -494,7 +494,7 @@ export function Conversation({
           </div>
         )}
         <form className="chat-composer" onSubmit={send}>
-          {reference && <div className="composer-reference"><GitBranch size={13} /><span title={reference.nodeId}>{reference.title}<small>{reference.nodeId.slice(0, 8)}</small></span><button type="button" className="icon-button" aria-label="Remove node reference" onClick={onClearReference}><X size={13} /></button></div>}
+          {reference?.nodeIds.map((nodeId, index) => <div className="composer-reference" key={nodeId}><GitBranch size={13} /><span title={nodeId}>{reference.titles[index] || "Research node"}<small>{nodeId.slice(0, 8)}</small></span><button type="button" className="icon-button" aria-label={`Remove ${reference.titles[index] || "node"} reference`} onClick={() => onClearReference?.(nodeId)}><X size={13} /></button></div>)}
           <textarea
             ref={input}
             aria-label="Message Sapling"

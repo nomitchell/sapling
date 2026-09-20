@@ -395,24 +395,8 @@ export function SettingsPanel({
           )}
           {section === "research" && (
             <>
-              <Row
-                name="Execution"
-                hint={
-                  config.execution_backend === "process"
-                    ? "Local code uses your Windows account’s access."
-                    : undefined
-                }
-              >
-                <select
-                  aria-label="Execution"
-                  value={config.execution_backend}
-                  onChange={(event) =>
-                    set("execution_backend", event.target.value)
-                  }
-                >
-                  <option value="process">Local process</option>
-                  <option value="docker">Docker container</option>
-                </select>
+              <Row name="Execution" hint="Experiments run locally with your Windows scientific environment.">
+                <span className="setting-static-value">Local Windows process</span>
               </Row>
               <Row name="Maximum simultaneous researchers">
                 <input

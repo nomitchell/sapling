@@ -631,7 +631,7 @@ export function Operations({
         <div>
           <span>Execution</span>
           <strong>
-            {label(project.settings?.execution_backend || "docker")}
+            {label(project.settings?.execution_backend || "process")}
           </strong>
         </div>
         <div>

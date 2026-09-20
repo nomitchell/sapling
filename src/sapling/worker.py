@@ -848,7 +848,25 @@ class Worker:
                     json.dumps(payload["evaluation"], ensure_ascii=False, default=str).encode(),
                     "evaluation.json", "evaluation_result", {"experiment_id": experiment["id"]})
                 artifacts.append(evaluation_artifact["id"])
-            collected = await backend.collect_artifacts(workspace)
+            artifact_collection_error = None
+            try:
+                collected = await backend.collect_artifacts(workspace)
+            except (OSError, RuntimeError, ValueError) as exc:
+                # Execution results and logs are already durable above. A
+                # collection problem must never erase a completed experiment.
+                collected = []
+                artifact_collection_error = f"{type(exc).__name__}: {exc}"
+                payload["artifact_collection_error"] = artifact_collection_error
+                artifact_error = save_artifact(
+                    self.store,
+                    self.data_dir,
+                    pid,
+                    artifact_collection_error.encode(),
+                    "artifact-collection-error.txt",
+                    "experiment_diagnostic",
+                    {"experiment_id": experiment["id"]},
+                )
+                artifacts.append(artifact_error["id"])
             for entry in collected[:50]:
                 info = serialize(entry)
                 path = Path(info.get("path", info.get("uri", "")))
@@ -884,7 +902,13 @@ class Worker:
                     {"status": status, "finished_at": now(), "result": payload, "artifact_ids": artifacts},
                 )
                 tx.event(
-                    pid, "EXPERIMENT_FINISHED", {"experiment_id": experiment["id"], "exit_code": exit_code}
+                    pid,
+                    "EXPERIMENT_FINISHED",
+                    {
+                        "experiment_id": experiment["id"],
+                        "exit_code": exit_code,
+                        "artifact_collection_error": artifact_collection_error,
+                    },
                 )
             return {
                 "summary": json.dumps(payload, default=str)[:16000],
@@ -904,6 +928,7 @@ class Worker:
                             "parent_experiment_id": parent_id,
                             "parent_commit": parent_commit,
                             "status": status,
+                            "artifact_collection_error": artifact_collection_error,
                             "timed_out": payload.get("timed_out", False),
                             "cancelled": payload.get("cancelled", False),
                         },

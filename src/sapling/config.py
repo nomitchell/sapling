@@ -20,7 +20,10 @@ class ProjectSettings(BaseModel):
     cadence: float = Field(default=0.45, ge=0, le=1)
     budget_total: float = Field(default=10, ge=0, le=1000000)
     permission_mode: Literal["ask", "balanced", "yolo"] = "balanced"
-    execution_backend: Literal["docker", "process"] = os.environ.get("SAPLING_EXECUTION_BACKEND", "docker")
+    # Sapling currently runs experiments directly on this Windows machine.  Keep
+    # the legacy Docker value readable for existing projects, but make the
+    # process backend the default and expose it as the only new-project choice.
+    execution_backend: Literal["docker", "process"] = os.environ.get("SAPLING_EXECUTION_BACKEND", "process")
     max_concurrent_holons: int = Field(default=4, ge=1, le=32)
     max_depth: int | None = Field(default=None, ge=1, le=20)
     experiment_timeout: int = Field(default=300, ge=1, le=86400)
@@ -68,5 +71,5 @@ class ProjectSettings(BaseModel):
 
 DATA_DIR = Path(os.environ.get("SAPLING_DATA_DIR", ".sapling")).resolve()
 DATABASE_URL = os.environ.get(
-    "SAPLING_DATABASE_URL", "postgresql+psycopg://sapling:sapling@127.0.0.1:54329/sapling"
+    "SAPLING_DATABASE_URL", f"sqlite:///{(DATA_DIR / 'sapling.sqlite3').as_posix()}"
 )

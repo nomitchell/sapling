@@ -121,6 +121,33 @@ def test_orphaned_active_conversation_is_requeued_after_restart(worker_app):
     assert any(item["type"] == "ORPHANED_TURN_RECOVERED" for item in events)
 
 
+def test_recovery_does_not_repeat_an_unchanged_noop_turn(worker_app):
+    _, store, worker, _ = worker_app
+    project, holon = create_project(worker_app)
+    with store.transaction() as tx:
+        tx.cancel_queued(holon["id"])
+        tx.update("projects", project["id"], {
+            "active_conversation_id": "no-op",
+            "conversation_requests": {
+                "no-op": {
+                    "id": "no-op", "state": "active", "budget_total": 1,
+                    "budget_spent": 0, "budget_reserved": 0, "model_calls": 0,
+                    "max_model_calls": 48, "tool_calls": 0, "max_tool_calls": 32,
+                }
+            },
+        })
+        tx.enqueue(project["id"], holon["id"], "turn", {
+            "reason": "orphaned_turn_recovery", "work_scope": "conversation:no-op"
+        })
+    leased = store.claim("no-op-worker")
+    assert leased is not None
+    store.finish(leased["id"], "no-op-worker")
+    worker._recover_orphaned_turns()
+    with store.transaction() as tx:
+        queued = [item for item in tx.jobs(project["id"]) if item["state"] == "queued"]
+    assert not queued
+
+
 def test_blocked_conversation_without_attention_is_normalized_to_a_handoff(worker_app):
     _, store, worker, _ = worker_app
     project, holon = create_project(worker_app)

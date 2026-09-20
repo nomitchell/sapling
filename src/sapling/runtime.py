@@ -375,8 +375,10 @@ When the user asks to steer an already-running campaign or one of its research
 nodes, use node_controls to guide that campaign owner. Do not replace persistent
 campaign researchers with temporary conversational children. Conversational child
 holons are only for explicitly bounded background work during the current exchange.
-When a direction is ready, ask exactly "Should I start autoresearch mode?"
-and return research_control.action="invite". Do not start in the same turn.
+When a direction is ready, include a substantive conversational response ending
+with exactly "Should I start autoresearch mode?" and return
+research_control.action="invite". Do not start or schedule more work in that
+same turn.
 The runtime asks a short invitation-intent model check before the next ordinary
 response. If it accepts the user's reply, research is already running by the time
 you receive that response. Do not emit research_control.action="start" for an
@@ -998,7 +1000,10 @@ def invitation_intent_context(tx: Any, project: dict, holon: dict) -> dict | Non
     human = tx.get("human_inputs", request.get("latest_human_input_id"))
     if not human or (
         human.get("created_at", "") <= invitation.get("created_at", "")
-        and human.get("id") != invitation.get("auto_check_human_input_id")
+        and human.get("id") not in {
+            invitation.get("auto_check_human_input_id"),
+            invitation.get("checking_human_input_id"),
+        }
     ):
         return None
     if invitation.get("last_intent_human_input_id") == human["id"]:
@@ -1036,7 +1041,10 @@ def apply_invitation_intent(
     human = tx.get("human_inputs", request.get("latest_human_input_id"))
     if not human or (
         human.get("created_at", "") <= invitation.get("created_at", "")
-        and human.get("id") != invitation.get("auto_check_human_input_id")
+        and human.get("id") not in {
+            invitation.get("auto_check_human_input_id"),
+            invitation.get("checking_human_input_id"),
+        }
     ):
         return False
     if expected_human_input_id is not None and human["id"] != expected_human_input_id:
@@ -1055,6 +1063,7 @@ def apply_invitation_intent(
         "last_intent": intent,
     }
     updated_invitation.pop("auto_check_human_input_id", None)
+    updated_invitation.pop("checking_human_input_id", None)
     if assessment.decision == "accept":
         updated_invitation.update({"status": "accepted", "accepted_human_input_id": human["id"]})
     elif assessment.decision == "decline":
@@ -1320,15 +1329,31 @@ def _human_controls(tx: Any, project: dict, holon: dict, decision: HolonDecision
             if not (decision.research_goal or project.get("goal")):
                 raise RuntimeRejected("Discuss a research direction before inviting continuous research")
             if not invitation or invitation.get("status") != "pending":
-                invitation = {"id": str(uuid4()), "status": "pending", "created_at": _now().isoformat(),
-                    "human_input_id": latest_human, "auto_check_human_input_id": latest_human}
+                # If this same message already declined or deferred a prior
+                # invitation, a refined invitation must wait for a new human
+                # reply. Reclassifying unchanged text creates duplicate
+                # answers and can loop forever after a useful scope completes.
+                already_assessed = bool(
+                    invitation
+                    and invitation.get("last_intent_human_input_id") == latest_human
+                    and (invitation.get("last_intent") or {}).get("decision") in {
+                        "decline", "continue_planning", "unclear"
+                    }
+                )
+                invitation = {
+                    "id": str(uuid4()), "status": "pending", "created_at": _now().isoformat(),
+                    "human_input_id": latest_human,
+                }
+                if not already_assessed:
+                    invitation["auto_check_human_input_id"] = latest_human
                 tx.update("projects", project["id"], {"research_invitation": invitation})
                 tx.event(project["id"], "RESEARCH_INVITED", invitation)
-                tx.enqueue(
-                    project["id"], holon["id"], "turn",
-                    {"reason": "invitation_auto_check", "work_scope": work_scope(holon)},
-                    priority=100.1,
-                )
+                if not already_assessed:
+                    tx.enqueue(
+                        project["id"], holon["id"], "turn",
+                        {"reason": "invitation_auto_check", "work_scope": work_scope(holon)},
+                        priority=100.1,
+                    )
         else:
             if control.human_input_id != latest_human:
                 raise RuntimeRejected("Research control must cite the latest human input")
@@ -1886,6 +1911,31 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
         # second attention input pauses the answer and duplicates the chat.
         decision = decision.model_copy(update={"attention_assessments": []})
         ignored.append("root_conversational_attention")
+    if (
+        request
+        and hid == project.get("root_holon_id")
+        and decision.research_control
+        and decision.research_control.action == "invite"
+    ):
+        # An invitation is a visible boundary between bounded conversation and
+        # continuous research. It must leave the actual scoped plan in
+        # Converse, rather than replacing it with a generic acknowledgement.
+        # A rejected decision is retried with targeted runtime feedback before
+        # it can create a durable invitation.
+        if not decision.response or not decision.response.rstrip().endswith(
+            "Should I start autoresearch mode?"
+        ):
+            raise RuntimeRejected(
+                "An autoresearch invitation requires a substantive response ending with "
+                "'Should I start autoresearch mode?'"
+            )
+        if decision.work_orders or decision.child_holon_requests or decision.branch_proposals:
+            decision = decision.model_copy(update={
+                "work_orders": [],
+                "child_holon_requests": [],
+                "branch_proposals": [],
+            })
+            ignored.append("invitation_work_deferred")
     if ignored:
         tx.event(pid, "DECISION_ACTIONS_IGNORED", {"holon_id": hid, "reasons": ignored})
     if (hid != project.get("root_holon_id") or not request) and (
@@ -2442,6 +2492,10 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
         decision.work_orders
         and hid == project.get("root_holon_id")
         and conversation_request(project, work_scope(holon))
+        and not (
+            decision.research_control
+            and decision.research_control.action == "invite"
+        )
     )
     if defer_converse_response and decision.response:
         tx.event(
@@ -3079,8 +3133,20 @@ async def assess_pending_invitation(
         expected = _fence(project, holon)
         request = conversation_request(project) or {}
         expected_human_input_id = request.get("latest_human_input_id")
+        # This check belongs solely to Converse. Clear the one-shot marker
+        # before the provider call so temporary children can keep working even
+        # if classification is slow or unavailable. A failed check is recorded
+        # below and waits for a genuinely new user message rather than retrying
+        # the same text indefinitely.
+        invitation = project.get("research_invitation") or {}
+        updated_invitation = {
+            **invitation,
+            "checking_human_input_id": expected_human_input_id,
+        }
+        updated_invitation.pop("auto_check_human_input_id", None)
+        tx.update("projects", project["id"], {"research_invitation": updated_invitation})
         tx.event(pid, "RESEARCH_INVITATION_CHECKING", {
-            "invitation_id": (project.get("research_invitation") or {}).get("id"),
+            "invitation_id": invitation.get("id"),
             "human_input_id": (conversation_request(project) or {}).get("latest_human_input_id"),
         })
     result = await _call_model(
@@ -3092,17 +3158,60 @@ async def assess_pending_invitation(
         InvitationIntent,
         expected_fence=expected,
         instructions=INVITATION_INTENT_INSTRUCTIONS,
-        max_output_tokens=128,
+        max_output_tokens=384,
         allow_failure=True,
         call_kind="invitation_intent",
     )
     if result is None:
+        with store.transaction() as tx:
+            project = tx.get("projects", pid)
+            invitation = (project or {}).get("research_invitation") or {}
+            request = conversation_request(project or {}) or {}
+            if (
+                invitation.get("status") == "pending"
+                and invitation.get("checking_human_input_id") == expected_human_input_id
+                and request.get("latest_human_input_id") == expected_human_input_id
+            ):
+                updated_invitation = {
+                    **invitation,
+                    "last_intent_human_input_id": expected_human_input_id,
+                    "last_intent": {
+                        "human_input_id": expected_human_input_id,
+                        "decision": "unclear",
+                        "reason": "Intent check was unavailable; awaiting a new user message.",
+                        "created_at": _now().isoformat(),
+                    },
+                }
+                updated_invitation.pop("auto_check_human_input_id", None)
+                updated_invitation.pop("checking_human_input_id", None)
+                tx.update("projects", pid, {"research_invitation": updated_invitation})
+                tx.event(pid, "RESEARCH_INVITATION_UNCLEAR", {
+                    "invitation_id": invitation.get("id"),
+                    "human_input_id": expected_human_input_id,
+                    "reason": "intent_check_unavailable",
+                })
         return None
     raw, _, _, _ = result
     try:
         assessment = raw if isinstance(raw, InvitationIntent) else InvitationIntent.model_validate(raw)
     except (TypeError, ValueError):
         with store.transaction() as tx:
+            project = tx.get("projects", pid)
+            invitation = (project or {}).get("research_invitation") or {}
+            if invitation.get("checking_human_input_id") == expected_human_input_id:
+                updated_invitation = {
+                    **invitation,
+                    "last_intent_human_input_id": expected_human_input_id,
+                    "last_intent": {
+                        "human_input_id": expected_human_input_id,
+                        "decision": "unclear",
+                        "reason": "Intent check returned invalid output; awaiting a new user message.",
+                        "created_at": _now().isoformat(),
+                    },
+                }
+                updated_invitation.pop("auto_check_human_input_id", None)
+                updated_invitation.pop("checking_human_input_id", None)
+                tx.update("projects", pid, {"research_invitation": updated_invitation})
             tx.event(pid, "RESEARCH_INVITATION_UNCLEAR", {"reason": "invalid_intent_output"})
         return None
     with store.transaction() as tx:
@@ -3145,8 +3254,10 @@ async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *
         if not project or not _runnable(tx, project, holon):
             return {"status": "skipped", "reason": "not_runnable"}
         pid = project["id"]
-        automatic_invitation_check = (project.get("research_invitation") or {}).get(
-            "auto_check_human_input_id"
+        automatic_invitation_check = (
+            (project.get("research_invitation") or {}).get("auto_check_human_input_id")
+            if holon_id == project.get("root_holon_id")
+            else None
         )
     invitation_result = await assess_pending_invitation(store, pid, holon_id, model)
     if invitation_result == "accepted":
@@ -3276,6 +3387,7 @@ async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *
                 item.get("work_scope") == work_scope(holon) and item.get("status") == "pending"
                 for item in tx.list("attention_items", project_id=pid)
             )
+            pending_invitation = (project.get("research_invitation") or {}).get("status") == "pending"
             if reported_block and not children and not pending_attention:
                 count = int(holon.get("empty_turn_count", 0)) + 1
                 tx.update(
@@ -3304,6 +3416,12 @@ async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *
                 tx.enqueue(pid, holon_id, "turn", {"reason": "blocked_completion_recovery"})
             elif reported_block:
                 tx.update("holons", holon_id, {"empty_turn_count": 0})
+            elif pending_invitation:
+                # An invitation is a durable conversational wait. Keep this
+                # scope open for its one-shot intent check or the user's next
+                # reply; completing it here would make the queued check
+                # unrunnable and leave Converse apparently silent.
+                tx.update("holons", holon_id, {"empty_turn_count": 0, "runtime_feedback": None})
             elif (decision.response or decision.completion) and not children:
                 tx.update("holons", holon_id, {"empty_turn_count": 0, "runtime_feedback": None})
                 update_request(tx, pid, work_scope(holon), {"state": "completed"})
@@ -3325,6 +3443,23 @@ async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *
             ]
             if active_children:
                 tx.update("holons", holon_id, {"empty_turn_count": 0, "runtime_feedback": None})
+            elif holon.get("parent_id"):
+                # A research leaf may have completed its useful synthesis
+                # without emitting an explicit completion object. Returning
+                # that result to its parent is safer than demanding invented
+                # follow-up work and eventually blocking the branch.
+                summary = decision.response or decision.updated_summary
+                _complete(
+                    tx,
+                    project,
+                    holon,
+                    HolonCompletion(summary=summary),
+                )
+                tx.event(
+                    pid,
+                    "RESEARCH_LEAF_HANDED_OFF",
+                    {"holon_id": holon_id, "parent_holon_id": holon.get("parent_id")},
+                )
             else:
                 count = int(holon.get("empty_turn_count", 0)) + 1
                 tx.update("holons", holon_id, {"empty_turn_count": count, "runtime_feedback":

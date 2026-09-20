@@ -12,12 +12,15 @@ from sapling.runtime import (
     BranchProposal,
     ChildHolonRequest,
     ConversationSynthesis,
+    HolonCompletion,
     HolonContextBuilder,
     HolonDecision,
     HolonMessage,
     InvitationIntent,
     NodeControl,
     ResearchControl,
+    RuntimeRejected,
+    WorkOrder,
     _runnable,
     _send,
     apply_decision,
@@ -119,6 +122,37 @@ def test_autoresearch_requires_invitation_then_model_assessed_agreement(workspac
         assert any(job["payload"].get("work_scope") == "research" for job in tx.jobs(p["id"]))
 
 
+def test_invitation_without_a_scoped_reply_is_retried_before_it_is_created(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Scope robust training."})
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        scope = "conversation:" + project["active_conversation_id"]
+        token = CURRENT_SCOPE.set(scope)
+        try:
+            with pytest.raises(RuntimeRejected, match="requires a substantive response"):
+                apply_decision(tx, project, root, HolonDecision(
+                    updated_summary="A research direction is ready.",
+                    research_goal="Compare direct robust-training alternatives.",
+                    research_control=ResearchControl(action="invite"),
+                    branch_proposals=[BranchProposal(
+                        key="premature-branch", parent_node_id="root", title="Premature branch",
+                        direction="This must wait for authorization.", rationale="Authorization boundary.",
+                    )],
+                    work_orders=[WorkOrder(
+                        node_id="root", kind="search_literature", arguments={"query": "robust training"},
+                        rationale="This must wait for authorization.",
+                    )],
+                ), HolonContextBuilder().build(tx, root, project))
+        finally:
+            CURRENT_SCOPE.reset(token)
+        messages = tx.list("messages", project_id=p["id"])
+        nodes = tx.list("research_nodes", project_id=p["id"])
+        assert tx.get("projects", p["id"])["research_invitation"] is None
+        assert len(messages) == 1
+        assert len(nodes) == 1
+        assert not any(job["payload"].get("reason") == "delegated" for job in tx.jobs(p["id"]))
 @pytest.mark.asyncio
 async def test_invitation_gate_starts_before_the_normal_research_turn(workspace):
     client, store, p, _ = workspace
@@ -161,6 +195,97 @@ async def test_invitation_gate_starts_before_the_normal_research_turn(workspace)
     assert seen[1][0]["project"]["last_autoresearch_transition"]["decision"] == "accept"
 
 
+@pytest.mark.asyncio
+async def test_unavailable_auto_invitation_check_does_not_gate_child_workers(workspace):
+    client, store, p, _ = workspace
+    sent = client.post(f"/projects/{p['id']}/messages", json={
+        "text": "Start autoresearch mode now."
+    }).json()
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        scope = "conversation:" + project["active_conversation_id"]
+        token = CURRENT_SCOPE.set(scope)
+        try:
+            apply_decision(tx, project, root, HolonDecision(
+                updated_summary="A campaign is ready.",
+                research_goal="Test robust generalization mechanisms.",
+                response="Should I start autoresearch mode?",
+                research_control=ResearchControl(action="invite"),
+            ), HolonContextBuilder().build(tx, root, project))
+            root_node = tx.get("research_nodes", root["assigned_node_id"])
+            child_node = tx.create("research_nodes", {
+                "project_id": p["id"], "parent_id": root_node["id"],
+                "owning_holon_id": "temporary-child", "delegated_holon_id": "temporary-child",
+                "title": "Parallel literature check", "direction": "Read a second source.",
+                "status": "active", "value_estimate": 0.5, "estimated_cost": 0,
+            })
+            child = tx.create("holons", {
+                "id": "temporary-child", "project_id": p["id"], "parent_id": root["id"],
+                "assigned_node_id": child_node["id"], "status": "active", "work_scope": scope,
+                "goal": "Read a second source.", "budget_total": 0.1, "budget_remaining": 0.1,
+            })
+        finally:
+            CURRENT_SCOPE.reset(token)
+
+    async def unavailable_intent(context, schema, settings):
+        if schema is InvitationIntent:
+            raise RuntimeError("intent provider unavailable")
+        raise AssertionError("Converse should suppress a duplicate reply for this same message")
+
+    result = await run_turn(store, root["id"], unavailable_intent, None, scope=scope)
+    assert result["status"] == "autoresearch_confirmation_pending"
+    with store.transaction() as tx:
+        invitation = tx.get("projects", p["id"])["research_invitation"]
+        assert "auto_check_human_input_id" not in invitation
+        assert "checking_human_input_id" not in invitation
+        assert invitation["last_intent_human_input_id"] == sent["human_input_id"]
+
+    async def child_model(context, schema, settings):
+        assert schema is HolonDecision
+        return {"decision": HolonDecision(
+            updated_summary="The child completed its check.",
+            completion=HolonCompletion(summary="The source check completed."),
+        ).model_dump(), "cost_usd": 0}
+
+    result = await run_turn(store, child["id"], child_model, None, scope=scope)
+    assert result["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_pending_invitation_keeps_its_conversation_runnable(workspace):
+    client, store, p, _ = workspace
+    client.post(f"/projects/{p['id']}/messages", json={"text": "Scope robust training first."})
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        scope = "conversation:" + project["active_conversation_id"]
+        token = CURRENT_SCOPE.set(scope)
+        try:
+            apply_decision(tx, project, root, HolonDecision(
+                updated_summary="The scope is ready.",
+                research_goal="Compare direct robust training objectives.",
+                response="Should I start autoresearch mode?",
+                research_control=ResearchControl(action="invite"),
+            ), HolonContextBuilder().build(tx, root, project))
+            project = tx.get("projects", p["id"])
+            assert project["research_invitation"]["status"] == "pending"
+            assert _runnable(tx, project, root, scope)
+        finally:
+            CURRENT_SCOPE.reset(token)
+
+    async def intent_model(context, schema, settings):
+        assert schema is InvitationIntent
+        return {"decision": {"decision": "continue_planning", "reason": "The user asked for scope, not execution."}, "cost_usd": 0}
+
+    result = await run_turn(store, p["root_holon_id"], intent_model, None, scope=scope)
+    assert result["status"] == "autoresearch_confirmation_pending"
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        assert project["conversation_requests"][project["active_conversation_id"]]["state"] == "active"
+        assert project["research_invitation"]["status"] == "pending"
+
+
 def test_invitation_auto_check_can_confirm_the_same_explicit_start_message(workspace):
     client, store, p, _ = workspace
     sent = client.post(f"/projects/{p['id']}/messages", json={
@@ -175,7 +300,7 @@ def test_invitation_auto_check_can_confirm_the_same_explicit_start_message(works
             apply_decision(tx, project, root, HolonDecision(
                 updated_summary="A concrete campaign is ready.",
                 research_goal="Test robust generalization mechanisms.",
-                response="I will check whether you want to begin now.",
+                response="The campaign has a concrete goal and initial plan. Should I start autoresearch mode?",
                 research_control=ResearchControl(action="invite"),
             ), HolonContextBuilder().build(tx, root, project))
             invited = tx.get("projects", p["id"])
@@ -191,6 +316,46 @@ def test_invitation_auto_check_can_confirm_the_same_explicit_start_message(works
             CURRENT_SCOPE.reset(token)
         started = tx.get("projects", p["id"])
         assert started["research_state"] == "running"
+
+
+def test_refined_invitation_after_a_decline_waits_for_new_human_input(workspace):
+    client, store, p, _ = workspace
+    sent = client.post(f"/projects/{p['id']}/messages", json={
+        "text": "Scope this first, then ask me before starting autoresearch."
+    }).json()
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        scope = "conversation:" + project["active_conversation_id"]
+        token = CURRENT_SCOPE.set(scope)
+        try:
+            apply_decision(tx, project, root, HolonDecision(
+                updated_summary="First scope.", research_goal="Compare robust-training alternatives.",
+                response="Initial scope. Should I start autoresearch mode?",
+                research_control=ResearchControl(action="invite"),
+            ), HolonContextBuilder().build(tx, root, project))
+            project = tx.get("projects", p["id"])
+            assert apply_invitation_intent(
+                tx, project, root,
+                InvitationIntent(decision="decline", reason="The user asked to scope first."),
+                expected_human_input_id=sent["human_input_id"],
+            ) is False
+            old_jobs = {job["id"] for job in tx.jobs(p["id"])}
+            apply_decision(tx, tx.get("projects", p["id"]), root, HolonDecision(
+                updated_summary="The detailed scope is now ready.",
+                research_goal="Compare robust-training alternatives.",
+                response="Detailed scope and plan. Should I start autoresearch mode?",
+                research_control=ResearchControl(action="invite"),
+            ), HolonContextBuilder().build(tx, root, tx.get("projects", p["id"])))
+        finally:
+            CURRENT_SCOPE.reset(token)
+        invitation = tx.get("projects", p["id"])["research_invitation"]
+        assert invitation["status"] == "pending"
+        assert "auto_check_human_input_id" not in invitation
+        assert not any(
+            job["id"] not in old_jobs and job["payload"].get("reason") == "invitation_auto_check"
+            for job in tx.jobs(p["id"])
+        )
 
 
 @pytest.mark.asyncio
@@ -1111,6 +1276,49 @@ async def test_temporary_researcher_response_completes_and_wakes_parent(workspac
         assert any(
             job["holon_id"] == p["root_holon_id"] and job["state"] == "queued"
             for job in tx.jobs(p["id"])
+        )
+
+
+@pytest.mark.asyncio
+async def test_research_leaf_response_hands_off_instead_of_becoming_blocked(workspace):
+    _, store, p, _ = workspace
+    with store.transaction() as tx:
+        project = tx.update("projects", p["id"], {"research_state": "running"})
+        root = tx.get("holons", p["root_holon_id"])
+        node = tx.create("research_nodes", {
+            "project_id": p["id"], "parent_id": root["assigned_node_id"],
+            "owning_holon_id": root["id"], "title": "Primary-paper check",
+            "direction": "Return the decisive source result", "status": "active",
+        })
+        child = tx.create("holons", {
+            "project_id": p["id"], "parent_id": root["id"], "work_scope": "research",
+            "goal": "Return the decisive source result", "summary": "", "assigned_node_id": node["id"],
+            "budget_total": 0.5, "budget_remaining": 0.5, "budget_reserved": 0,
+            "depth": 1, "status": "active", "control_epoch": 0, "turn_count": 0,
+        })
+        tx.update("research_nodes", node["id"], {
+            "owning_holon_id": child["id"], "delegated_holon_id": child["id"],
+        })
+
+    async def model(context, schema, settings):
+        return {
+            "decision": HolonDecision(
+                response="The primary result supports the short fast-AT route under the shared protocol.",
+                updated_summary="Returned the primary result to the campaign coordinator.",
+            ),
+            "usage": {}, "cost_usd": 0,
+        }
+
+    await run_turn(store, child["id"], model, None, scope="research")
+    with store.transaction() as tx:
+        completed = tx.get("holons", child["id"])
+        assert completed["status"] == "completed"
+        assert completed.get("empty_turn_count", 0) == 0
+        assert tx.get("research_nodes", node["id"])["status"] == "completed"
+        assert any(event["type"] == "RESEARCH_LEAF_HANDED_OFF" for event in tx.history(p["id"]))
+        assert any(
+            message["recipient_holon_id"] == root["id"] and "short fast-AT" in message["summary"]
+            for message in tx.list("holon_messages", project_id=p["id"])
         )
 
 

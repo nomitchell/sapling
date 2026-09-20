@@ -181,6 +181,29 @@ class Worker:
                     ) or (request is not None and request.get("state") == "active")
                     if not eligible or holon["id"] in live_holons:
                         continue
+                    invitation = project.get("research_invitation") or {}
+                    if (
+                        holon["id"] == project.get("root_holon_id")
+                        and invitation.get("status") == "pending"
+                        and not invitation.get("auto_check_human_input_id")
+                    ):
+                        # A pending invitation is waiting for new human input,
+                        # not an orphaned coordinator turn. The one exception
+                        # is its persisted auto-check, which remains restart
+                        # safe because it is a concrete queued action.
+                        continue
+                    # Recovery repairs one lost wake after a restart. It must
+                    # never become a second scheduler that repeatedly revives
+                    # an unchanged no-op turn. New input, work, child reports,
+                    # or an explicit retry create the next real wake.
+                    completed = [
+                        job
+                        for job in jobs
+                        if job.get("holon_id") == holon["id"] and job.get("state") == "completed"
+                    ]
+                    latest = max(completed, key=lambda job: job.get("created_at", ""), default=None)
+                    if latest and latest.get("payload", {}).get("reason") == "orphaned_turn_recovery":
+                        continue
                     if holon["id"] == project.get("root_holon_id") and any(
                         child.get("status") != "completed"
                         and child.get("work_scope") == scope

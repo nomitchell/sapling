@@ -186,6 +186,22 @@ function NodeRecords({ data, node }: { data: ProjectData; node: RecordItem }) {
   const holons = data.holarchy.filter(item => item.assigned_node_id === node.id);
   const holonIds = new Set(holons.map(item => item.id));
   const belongs = (item: RecordItem) => item.node_id === node.id || item.origin_node_id === node.id || holonIds.has(String(item.holon_id || item.origin_holon_id));
+  const activity = data.events
+    .filter(event => String(event.payload.node_id || "") === node.id || holonIds.has(String(event.payload.holon_id || "")))
+    .slice(-6)
+    .reverse();
   const groups = [{ name: "Evidence", records: data.evidence.filter(belongs) }, { name: "Claims", records: data.claims.filter(belongs) }, { name: "Experiments", records: data.experiments.filter(belongs) }, { name: "Researchers", records: holons }];
-  return <div className="node-records">{groups.filter(group => group.records.length).map(group => <details key={group.name}><summary>{group.name}<span>{group.records.length}</span></summary>{group.records.map(item => <article key={item.id}><strong>{field(item, "title", "statement", "claim", "text", "name", "goal") || group.name.slice(0, -1)}</strong>{field(item, "summary", "content", "description") && <Markdown>{field(item, "summary", "content", "description")}</Markdown>}{field(item, "url", "source_url") && /^https?:\/\//.test(field(item, "url", "source_url")) && <a href={field(item, "url", "source_url")} target="_blank" rel="noreferrer">Open source <ExternalLink size={12} /></a>}<small>{label(item.status)}{item.created_at ? ` · ${date(item.created_at)}` : ""}</small></article>)}</details>)}</div>;
+  return <div className="node-records">{activity.length > 0 && <details open><summary>Activity<span>{activity.length}</span></summary>{activity.map(event => { const payload = event.payload as Record<string, unknown>; return <article key={String(event.id)}><strong>{nodeActivity(event)}</strong>{Boolean(payload.summary) && <Markdown>{String(payload.summary)}</Markdown>}<small>{date(String(event.created_at || ""))}</small></article>; })}</details>}{groups.filter(group => group.records.length).map(group => <details key={group.name}><summary>{group.name}<span>{group.records.length}</span></summary>{group.records.map(item => <article key={item.id}><strong>{field(item, "title", "statement", "claim", "text", "name", "goal") || group.name.slice(0, -1)}</strong>{field(item, "summary", "content", "description") && <Markdown>{field(item, "summary", "content", "description")}</Markdown>}{field(item, "url", "source_url") && /^https?:\/\//.test(field(item, "url", "source_url")) && <a href={field(item, "url", "source_url")} target="_blank" rel="noreferrer">Open source <ExternalLink size={12} /></a>}<small>{label(item.status)}{item.created_at ? ` · ${date(item.created_at)}` : ""}</small></article>)}</details>)}</div>;
+}
+
+function nodeActivity(event: RecordItem) {
+  const kind = String(event.type || "").replaceAll("_", " ").toLowerCase();
+  const payload = event.payload as Record<string, unknown>;
+  const work = String(payload.kind || "").replaceAll("_", " ");
+  if (event.type === "TOOL_STARTED") return work ? `Started ${work}` : "Started a research action";
+  if (event.type === "JOB_STARTED") return "Agent started working";
+  if (event.type === "MODEL_STREAM") return "Agent is forming a result";
+  if (event.type === "MODEL_TURN") return "Agent finished a reasoning step";
+  if (event.type === "WORK_ORDER_SELECTED") return work ? `Selected ${work}` : "Selected next action";
+  return kind ? kind[0].toUpperCase() + kind.slice(1) : "Research activity";
 }

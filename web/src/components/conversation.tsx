@@ -87,7 +87,7 @@ export function Conversation({
   const rootJobs = jobs.filter(job => {
     const payload = (job.payload || {}) as Record<string, unknown>;
     const jobScope = String(payload.work_scope || "");
-    return ["running", "queued"].includes(String(job.state)) && (
+    return String(job.holon_id || "") === String(project.root_holon_id || "") && ["running", "queued"].includes(String(job.state)) && (
       (scope !== null && jobScope === scope) ||
       (settingUpAutoresearch && jobScope === "research")
     );

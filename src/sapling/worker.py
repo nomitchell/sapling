@@ -167,12 +167,18 @@ class Worker:
                         tx.event(project["id"], "CONVERSATION_BLOCK_NORMALIZED", {"holon_id": holon["id"]})
                 for holon in tx.list("holons", project_id=project["id"], status="active"):
                     scope = holon.get("work_scope") or "research"
+                    handoff = project.get("autoresearch_handoff") or {}
                     if holon["id"] == project.get("root_holon_id"):
                         request_id = project.get("active_conversation_id")
-                        if request_id:
+                        if handoff.get("status") == "setting_up":
+                            scope = "research"
+                        elif request_id:
                             scope = "conversation:" + request_id
                     request = conversation_request(project, scope)
-                    eligible = request is not None and request.get("state") == "active"
+                    eligible = (
+                        holon["id"] == project.get("root_holon_id")
+                        and handoff.get("status") == "setting_up"
+                    ) or (request is not None and request.get("state") == "active")
                     if not eligible or holon["id"] in live_holons:
                         continue
                     if holon["id"] == project.get("root_holon_id") and any(

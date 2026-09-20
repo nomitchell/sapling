@@ -58,6 +58,7 @@ class BranchProposal(Record):
     title: str = Field(min_length=1, max_length=300)
     direction: str
     rationale: str
+    type: Literal["inquiry", "literature", "theory", "method", "experiment", "synthesis"] = "inquiry"
     possible_outcomes: list[PossibleOutcome] = Field(default_factory=list, max_length=8)
     estimated_cost: float = Field(default=1, ge=0)
     value: float = Field(default=0, ge=0, le=1)
@@ -268,6 +269,10 @@ While gathering evidence, response can be null; return a synthesis when ready.
 Never return only a progress_note with no work_orders or other action. Writing
 that work is queued does not queue anything. At a stopping point, put the answer
 in response, not progress_note.
+For a bounded Converse turn that selects a root-local tool action or delegates
+background work, response must be null. Put a short status in progress_note and
+let the later synthesis be the one visible answer. Never give an interim answer
+and then restart the same reply after the tool result.
 If literature search is requested, actually search, then read sources and return a
 grounded synthesis with source links. Do not claim a search happened until it did.
 If a broad search returns only surveys, refine the query to a short targeted phrase
@@ -390,9 +395,15 @@ material human update: a direct child resolved an important question, a result c
 candidate selection, a decision needs human judgment, or a campaign milestone is reached.
 Otherwise leave user_report null and continue through nodes, evidence, artifacts, and
 parent messages. Do not turn every tool result or child completion into chat prose.
-When autoresearch_handoff.status is "setting_up", create or delegate the initial
-non-overlapping branches and return one concise user_report that says what has started.
-Do not run root-local tools in that setup turn.
+Choose a node type that describes its main job: literature for source discovery and
+reading, theory for proofs or decisive conceptual analysis, method for a proposed
+algorithm or model, experiment for an executable empirical check, and synthesis for
+comparison or integration. Use inquiry only while the branch is genuinely exploratory.
+When autoresearch_handoff.status is "setting_up", create and delegate two or more
+initial non-overlapping branches. Do not claim that the campaign has started unless
+your branch_proposals and child_holon_requests actually create those workers. Return
+one concise user_report only after they are present. Do not run root-local tools in
+that setup turn. Never describe branches only in prose while leaving action lists empty.
 Use node_controls with a referenced node and human_input_id for explicit guidance,
 delegation, pause, resume or termination. When the human explicitly asks to delegate
 an existing campaign node, use action="delegate"; this creates a persistent campaign
@@ -985,7 +996,10 @@ def invitation_intent_context(tx: Any, project: dict, holon: dict) -> dict | Non
     ):
         return None
     human = tx.get("human_inputs", request.get("latest_human_input_id"))
-    if not human or human.get("created_at", "") <= invitation.get("created_at", ""):
+    if not human or (
+        human.get("created_at", "") <= invitation.get("created_at", "")
+        and human.get("id") != invitation.get("auto_check_human_input_id")
+    ):
         return None
     if invitation.get("last_intent_human_input_id") == human["id"]:
         return None
@@ -1020,7 +1034,10 @@ def apply_invitation_intent(
     if not request or invitation.get("status") != "pending":
         return False
     human = tx.get("human_inputs", request.get("latest_human_input_id"))
-    if not human or human.get("created_at", "") <= invitation.get("created_at", ""):
+    if not human or (
+        human.get("created_at", "") <= invitation.get("created_at", "")
+        and human.get("id") != invitation.get("auto_check_human_input_id")
+    ):
         return False
     if expected_human_input_id is not None and human["id"] != expected_human_input_id:
         return False
@@ -1037,6 +1054,7 @@ def apply_invitation_intent(
         "last_intent_human_input_id": human["id"],
         "last_intent": intent,
     }
+    updated_invitation.pop("auto_check_human_input_id", None)
     if assessment.decision == "accept":
         updated_invitation.update({"status": "accepted", "accepted_human_input_id": human["id"]})
     elif assessment.decision == "decline":
@@ -1303,9 +1321,14 @@ def _human_controls(tx: Any, project: dict, holon: dict, decision: HolonDecision
                 raise RuntimeRejected("Discuss a research direction before inviting continuous research")
             if not invitation or invitation.get("status") != "pending":
                 invitation = {"id": str(uuid4()), "status": "pending", "created_at": _now().isoformat(),
-                    "human_input_id": latest_human}
+                    "human_input_id": latest_human, "auto_check_human_input_id": latest_human}
                 tx.update("projects", project["id"], {"research_invitation": invitation})
                 tx.event(project["id"], "RESEARCH_INVITED", invitation)
+                tx.enqueue(
+                    project["id"], holon["id"], "turn",
+                    {"reason": "invitation_auto_check", "work_scope": work_scope(holon)},
+                    priority=100.1,
+                )
         else:
             if control.human_input_id != latest_human:
                 raise RuntimeRejected("Research control must cite the latest human input")
@@ -1931,6 +1954,7 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
         title: str,
         direction: str,
         rationale: str,
+        node_type: str = "inquiry",
         possible_outcomes: list[PossibleOutcome] | None = None,
         estimated_cost: float = 1,
         value: float = 0.5,
@@ -1956,6 +1980,7 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 "parent_id": parent["id"],
                 "owning_holon_id": hid,
                 "title": title[:300],
+                "type": node_type,
                 "direction": direction,
                 "rationale": rationale,
                 "possible_outcomes": [o.model_dump() for o in (possible_outcomes or [])],
@@ -2022,6 +2047,7 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 title=proposal.title,
                 direction=proposal.direction,
                 rationale=proposal.rationale,
+                node_type=proposal.type,
                 possible_outcomes=proposal.possible_outcomes,
                 estimated_cost=proposal.estimated_cost,
                 value=proposal.value,
@@ -2400,9 +2426,10 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
         and (tx.get("holons", message.get("sender_holon_id")) or {}).get("parent_id") == hid
         and float(message.get("importance", 0)) >= 0.7
     ]
+    setup_report_text = None
     report_text = None
     if handoff_setting_up:
-        report_text = decision.user_report or decision.response or "Autoresearch is now running. I started the initial research branches and will bring material results back here for steering."
+        setup_report_text = decision.user_report or decision.response or "Autoresearch is now running. I started the initial research branches and will bring material results back here for steering."
     elif decision.user_report and hid == project.get("root_holon_id") and work_scope(holon) == "research":
         if direct_reports:
             report_text = decision.user_report
@@ -2696,6 +2723,67 @@ def apply_decision(tx: Any, project: dict, holon: dict, decision: HolonDecision,
                 )
     else:
         tx.update("holons", hid, {"pending_decision_snapshot_id": snapshot["id"]})
+    if handoff_setting_up:
+        if children:
+            report_nodes = sorted(
+                tx.get("holons", child_id)["assigned_node_id"]
+                for child_id in children
+                if tx.get("holons", child_id)
+            )
+            report = tx.create(
+                "messages",
+                {
+                    "project_id": pid,
+                    "holon_id": hid,
+                    "role": "assistant",
+                    "channel": "answer",
+                    "text": setup_report_text,
+                    "node_ids": report_nodes,
+                    "evidence_ids": [],
+                    "work_scope": "research",
+                },
+            )
+            tx.event(
+                pid,
+                "REPORT_BUBBLED_TO_CONVERSE",
+                {
+                    "message_id": report["id"],
+                    "holon_id": hid,
+                    "node_ids": report_nodes,
+                    "evidence_ids": [],
+                    "handoff": True,
+                },
+            )
+        else:
+            repair_count = int(handoff.get("repair_count", 0)) + 1
+            tx.update(
+                "projects",
+                pid,
+                {"autoresearch_handoff": {**handoff, "repair_count": repair_count}},
+            )
+            tx.update(
+                "holons",
+                hid,
+                {
+                    "runtime_feedback": (
+                        "Autoresearch setup is incomplete: you described branches but created no "
+                        "durable child workers. Return two non-overlapping branch_proposals and "
+                        "matching child_holon_requests now. Do not respond to the user yet."
+                    )
+                },
+            )
+            tx.event(
+                pid,
+                "AUTORESEARCH_SETUP_REPAIR_QUEUED",
+                {"holon_id": hid, "repair_count": repair_count},
+            )
+            tx.enqueue(
+                pid,
+                hid,
+                "turn",
+                {"reason": "autoresearch_setup_incomplete", "work_scope": "research"},
+                priority=100.2,
+            )
     tx.event(
         pid,
         "DECISION_APPLIED",
@@ -3046,12 +3134,20 @@ async def _run_turn(store: Any, holon_id: str, model: Any, tool_dispatch: Any, *
         if not project or not _runnable(tx, project, holon):
             return {"status": "skipped", "reason": "not_runnable"}
         pid = project["id"]
+        automatic_invitation_check = (project.get("research_invitation") or {}).get(
+            "auto_check_human_input_id"
+        )
     invitation_result = await assess_pending_invitation(store, pid, holon_id, model)
     if invitation_result == "accepted":
         # set_research_state has queued a new research-scoped coordinator turn.
         # That turn sees last_autoresearch_transition and produces the first
         # real campaign response, rather than relying on invitation prose.
         return {"status": "autoresearch_started"}
+    if automatic_invitation_check:
+        # The invitation was just created from this same human turn. Its
+        # visible response already asks for confirmation, so a non-accepting
+        # self-check must not generate a second conversational reply.
+        return {"status": "autoresearch_confirmation_pending", "decision": invitation_result}
     with store.transaction() as tx:
         project, holon = tx.get("projects", pid), tx.get("holons", holon_id)
         if not project or not holon or not _runnable(tx, project, holon):

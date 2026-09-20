@@ -161,6 +161,38 @@ async def test_invitation_gate_starts_before_the_normal_research_turn(workspace)
     assert seen[1][0]["project"]["last_autoresearch_transition"]["decision"] == "accept"
 
 
+def test_invitation_auto_check_can_confirm_the_same_explicit_start_message(workspace):
+    client, store, p, _ = workspace
+    sent = client.post(f"/projects/{p['id']}/messages", json={
+        "text": "Start autoresearch mode on robust generalization now."
+    }).json()
+    with store.transaction() as tx:
+        project = tx.get("projects", p["id"])
+        root = tx.get("holons", p["root_holon_id"])
+        scope = "conversation:" + project["active_conversation_id"]
+        token = CURRENT_SCOPE.set(scope)
+        try:
+            apply_decision(tx, project, root, HolonDecision(
+                updated_summary="A concrete campaign is ready.",
+                research_goal="Test robust generalization mechanisms.",
+                response="I will check whether you want to begin now.",
+                research_control=ResearchControl(action="invite"),
+            ), HolonContextBuilder().build(tx, root, project))
+            invited = tx.get("projects", p["id"])
+            assert invited["research_invitation"]["auto_check_human_input_id"] == sent["human_input_id"]
+            assert apply_invitation_intent(
+                tx,
+                invited,
+                root,
+                InvitationIntent(decision="accept", reason="The user directly asked to start now."),
+                expected_human_input_id=sent["human_input_id"],
+            )
+        finally:
+            CURRENT_SCOPE.reset(token)
+        started = tx.get("projects", p["id"])
+        assert started["research_state"] == "running"
+
+
 @pytest.mark.asyncio
 async def test_autoresearch_handoff_closes_old_conversation_after_initial_branches(workspace):
     client, store, p, _ = workspace
@@ -210,6 +242,34 @@ async def test_autoresearch_handoff_closes_old_conversation_after_initial_branch
             job["state"] == "queued" and job["payload"].get("work_scope") == scope
             for job in tx.jobs(p["id"])
         )
+
+
+def test_autoresearch_setup_repairs_empty_branch_plan_without_false_report(workspace):
+    _, store, p, _ = workspace
+    with store.transaction() as tx:
+        root = tx.get("holons", p["root_holon_id"])
+        tx.update("projects", p["id"], {
+            "research_state": "running",
+            "research_invitation": {"accepted_human_input_id": "accepted"},
+            "autoresearch_handoff": {
+                "status": "setting_up", "conversation_id": "old", "human_input_id": "accepted",
+            },
+        })
+        token = CURRENT_SCOPE.set("research")
+        try:
+            apply_decision(tx, tx.get("projects", p["id"]), root, HolonDecision(
+                updated_summary="I described branches but scheduled none.",
+                response="Autoresearch is running with two branches.",
+                user_report="This must not appear until workers exist.",
+            ), HolonContextBuilder().build(tx, root, tx.get("projects", p["id"])))
+        finally:
+            CURRENT_SCOPE.reset(token)
+        assert not any(message.get("channel") == "answer" for message in tx.list("messages", p["id"]))
+        assert any(
+            job["payload"].get("reason") == "autoresearch_setup_incomplete"
+            for job in tx.jobs(p["id"])
+        )
+        assert tx.get("projects", p["id"])["autoresearch_handoff"]["status"] == "setting_up"
 
 
 def test_only_fresh_direct_child_reports_can_bubble_to_converse(workspace):

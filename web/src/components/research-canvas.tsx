@@ -153,9 +153,10 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
           const state = count.blocked ? "blocked" : count.unread ? "unread" : done ? "done" : record.status === "paused" ? "paused" : count.running ? "running" : queuedNodes.has(record.id) || (!isRoot && Number(record.visits || 0) === 0) ? "queued" : "idle";
           const agentState = runningNodes.has(record.id) ? "running" : state === "queued" ? "queued" : state === "done" ? "done" : "idle";
           const title = isRoot ? "Converse" : field(record, "title", "question", "goal") || project.title;
+          const type = nodeType(record);
           return <div className={`research-node state-${state} ${selectedId === record.id ? "selected" : ""}`} key={record.id} style={{ left: x, top: y, width: WIDTH, height: HEIGHT }}>
             <button className="research-node-main" aria-label={`${title}, ${state === "unread" ? "check me" : state}`} aria-pressed={selectedId === record.id} onClick={() => { setSelectedId(record.id); setCopied(false); }}>
-              <span className="research-node-top"><span>{isRoot ? <Sprout size={13} /> : <GitBranch size={12} />}{isRoot ? "Converse" : label(record.type || "inquiry")}</span><span className={`node-agent-status ${agentState}`} title={agentState === "running" ? "Agent running on this node" : agentState === "queued" ? "Agent work is queued" : agentState === "done" ? "This node has completed its purpose" : "No agent running on this node"}><i />{agentState === "running" ? "live" : agentState}</span></span>
+              <span className="research-node-top"><span>{isRoot ? <Sprout size={13} /> : <GitBranch size={12} />}{isRoot ? "Converse" : label(type)}</span><span className={`node-agent-status ${agentState}`} title={agentState === "running" ? "Agent running on this node" : agentState === "queued" ? "Agent work is queued" : agentState === "done" ? "This node has completed its purpose" : "No agent running on this node"}><i />{agentState === "running" ? "live" : agentState}</span></span>
               <strong>{title}</strong>
               <span className="research-node-bottom">{state === "blocked" ? "Needs your input" : state === "unread" ? "Check me" : state === "running" ? "Researching" : state === "queued" ? "Queued" : state === "done" ? "Done" : state === "idle" ? "Idle" : label(state)}{collapsed.has(record.id) && (count.running + count.unread + count.blocked > 0) && <small>{count.blocked ? `${count.blocked} waiting` : count.unread ? `${count.unread} unread` : `${count.running} active`}</small>}</span>
             </button>
@@ -180,6 +181,18 @@ export function ResearchCanvas({ project, data, onDiscuss, onRefresh, onError, o
       <footer><button className="button primary" onClick={() => onDiscuss({ nodeId: selected.id, title: field(selected, "title", "question", "goal") || project.title, attentionIds: selectedAttention.map(item => item.id) })}><MessageSquare size={14} />Discuss in Converse</button></footer>
     </aside>}
   </div>;
+}
+
+function nodeType(node: RecordItem) {
+  const declared = String(node.type || "").trim();
+  if (declared && declared !== "inquiry") return declared;
+  const text = `${field(node, "title", "question", "goal")} ${field(node, "direction", "rationale")}`.toLowerCase();
+  if (/literature|paper|source|bibliograph|survey/.test(text)) return "literature";
+  if (/experiment|ablation|benchmark|evaluate|test|run /.test(text)) return "experiment";
+  if (/proof|theor|deriv|formal|mechanism/.test(text)) return "theory";
+  if (/synthes|compar|integrat|select/.test(text)) return "synthesis";
+  if (/method|algorithm|architecture|recipe|approach/.test(text)) return "method";
+  return "inquiry";
 }
 
 function NodeRecords({ data, node }: { data: ProjectData; node: RecordItem }) {
